@@ -79,7 +79,10 @@ DEFAULT_IFACE = r"\Device\NPF_Loopback"
 DEFAULT_TARGET_IP = "127.0.0.1"
 DEFAULT_TARGET_PORT = 9999
 DEFAULT_PAYLOAD_BYTES = 64
-DEFAULT_SERVER_PORT = 8765
+# Any free port. Windows lets a second socket share a bound port, so naming a
+# fixed one risks polling somebody else's server without ever saying so - and
+# nothing outside this process needs to reach the benchmark's endpoint.
+DEFAULT_SERVER_PORT = 0
 DEFAULT_SUBNET = "192.168.2.0/24"
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "benchmark-results"
 
@@ -627,7 +630,7 @@ def run_group(
         target=server.serve_forever, name="benchmark-http", daemon=True
     )
     poller = RatesPoller(
-        f"http://{SERVER_BIND_HOST}:{args.server_port}/api/rates"
+        f"http://{SERVER_BIND_HOST}:{server.server_address[1]}/api/rates"
     )
 
     results: list[StepResult] = []
@@ -948,7 +951,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--server-port",
         type=int,
         default=DEFAULT_SERVER_PORT,
-        help=f"port for the polled /api/rates server (default: {DEFAULT_SERVER_PORT})",
+        help="port for the polled /api/rates server, 0 for any free one "
+        f"(default: {DEFAULT_SERVER_PORT})",
     )
     sweep.add_argument(
         "--subnet",
