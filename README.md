@@ -3,9 +3,12 @@
 A small Python web server that monitors live packet traffic on a subnet to detect connection dropouts.
 
 It runs on the topside computer at `192.168.2.1` and serves a dark single page
-showing, for every device on `192.168.2.0/24` that sends it a packet, a live
-10-second graph of that device's packet rate. The page is sized to be embedded
-as an iframe panel in Blue Robotics Cockpit.
+showing, for every device on the watched subnet that sends it a packet, a live
+10-second graph of that device's packet rate. The subnet is set from the page
+itself and defaults to `192.168.2.0/24`. Once a device has been seen it keeps
+its row for the life of the process, so a device going quiet reads as a
+flatline rather than a disappearing row. The page is sized to be embedded as an
+iframe panel in Blue Robotics Cockpit.
 
 ## Phases
 
@@ -22,13 +25,15 @@ No runtime dependencies — the app needs nothing but the standard library.
 python -m netmon.server --mock
 ```
 
-Then open <http://localhost:8080>.
+Then open <http://localhost:8080>. If that port is already in use, pass
+`--port` and open the port you chose instead.
 
 ### Flags
 
 - `--port` — listen port (default `8080`)
 - `--host` — bind address (default `0.0.0.0`)
 - `--host-ip` — address reported to the UI as the monitored host (default `192.168.2.1`)
+- `--subnet` — subnet used when the page does not ask for one (default `192.168.2.0/24`)
 - `--mock` — feed the aggregator with synthetic traffic
 - `--capture-status STATE` — force the reported capture state, to review the status banner
 
