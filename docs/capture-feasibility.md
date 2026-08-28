@@ -253,7 +253,158 @@ and hand parsing to `dpkt`, which touches only `netmon/capture.py`.
 
 ## Measured throughput
 
-The numbers observed from the benchmark harness (`tools/`) are recorded here.
+The estimate above is optimistic. **The capture path sustains about 1,700
+packets/second, and needs 0.94 of a core to do it** — roughly 550–640
+microseconds of CPU per packet rather than the 100–300 assumed above. Against
+the 1,000–5,000 packets/second a BlueROV2 is expected to produce, the ceiling
+sits at the *bottom* of the expected range. The margin is thin, not
+comfortable, and anything at the upper end of that range will not fit.
+
+The figures come from `tools/benchmark_capture.py`, a loopback sweep that drives
+the shipped capture path — Npcap, the kernel filter, scapy's dissection, the
+packet callback, `RateWindow.record` — against a paced UDP generator running in
+a separate process, thirty seconds per step. A 2 Hz poller runs against a real
+`/api/rates` endpoint throughout, and the sweep repeats at three retained-address
+counts, because `RateWindow.snapshot` holds the lock the callback needs. Each
+step records four numbers together, since any one alone misleads: packets that
+reached the callback, the driver's `ps_recv` and `ps_drop`, the capture thread's
+CPU time, and the generator's own send count as ground truth for offered load.
+
+`unproc` below is `ps_recv − ps_drop − counted`: packets the driver accepted and
+did not report as dropped, which nonetheless never reached the callback.
+
+| preload | offered | sent | counted | sustained pps | ps_recv | ps_drop | drop/recv | unproc | cores | poll mean ms | poll max ms |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 0 | 0 | 0 | 1660 | 55.3 | 1660 | 0 | 0.0000 | 0 | 0.039 | 14.1 | 125.1 |
+| 0 | 500 | 14999 | 16626 | 554.2 | 16626 | 0 | 0.0000 | 0 | 0.405 | 15.1 | 51.2 |
+| 0 | 1000 | 29999 | 31639 | 1054.6 | 31639 | 0 | 0.0000 | 0 | 0.680 | 20.3 | 42.4 |
+| 0 | 2500 | 74999 | 50828 | **1694.1** | 76563 | 16790 | 0.2193 | 8945 | 0.937 | 43.5 | 250.0 |
+| 0 | 5000 | 149999 | 50811 | 1693.2 | 151571 | 97134 | 0.6408 | 3626 | 0.933 | 39.1 | 73.8 |
+| 0 | 10000 | 299999 | 50366 | 1678.7 | 301481 | 246193 | 0.8166 | 4922 | 0.929 | 41.1 | 74.8 |
+| 0 | 20000 | 598211 | 48078 | 1602.4 | 599768 | 546558 | 0.9113 | 5132 | 0.895 | 42.3 | 192.6 |
+| 1000 | 0 | 0 | 1485 | 49.5 | 1485 | 0 | 0.0000 | 0 | 0.030 | 75.7 | 400.3 |
+| 1000 | 500 | 14999 | 16488 | 549.6 | 16484 | 0 | 0.0000 | −4 | 0.344 | 70.9 | 192.8 |
+| 1000 | 1000 | 29999 | 31459 | 1048.5 | 31459 | 0 | 0.0000 | 0 | 0.634 | 86.6 | 343.1 |
+| 1000 | 2500 | 74999 | 43049 | **1433.9** | 76439 | 23969 | 0.3136 | 9421 | 0.770 | 97.0 | 197.4 |
+| 1000 | 5000 | 149999 | 42200 | 1405.9 | 151451 | 104757 | 0.6917 | 4494 | 0.779 | 99.5 | 182.7 |
+| 1000 | 10000 | 299999 | 42382 | 1412.5 | 301347 | 254800 | 0.8455 | 4165 | 0.758 | 119.8 | 350.9 |
+| 1000 | 20000 | 599999 | 41842 | 1394.6 | 601413 | 557025 | 0.9262 | 2546 | 0.763 | 103.0 | 202.9 |
+| 10000 | 0 | 0 | 872 | 29.0 | 861 | 0 | 0.0000 | −11 | 0.024 | 567.3 | 735.8 |
+| 10000 | 500 | 14999 | 7935 | 264.4 | 15838 | **0** | 0.0000 | **7903** | 0.137 | 615.5 | 801.4 |
+| 10000 | 1000 | 29999 | 6013 | 199.8 | 30793 | 21931 | 0.7122 | 2849 | 0.115 | 710.1 | 1438.6 |
+| 10000 | 2500 | 74999 | 6043 | **201.3** | 75786 | 69120 | 0.9120 | 623 | 0.112 | 657.3 | 1059.2 |
+| 10000 | 5000 | 149999 | 4698 | 156.5 | 150765 | 146313 | 0.9705 | −246 | 0.090 | 658.5 | 836.6 |
+| 10000 | 10000 | 299999 | 5577 | 185.7 | 300774 | 294097 | 0.9778 | 1100 | 0.110 | 649.1 | 760.6 |
+| 10000 | 20000 | 599999 | 5029 | 167.5 | 600576 | 596126 | 0.9926 | −579 | 0.099 | 670.6 | 800.8 |
+
+`counted` slightly exceeds `sent` at low rates because the capture also sees the
+poller's own HTTP packets and ambient loopback traffic; the 0 pps rows measure
+that background at roughly 55 packets/second. The small negative `unproc` values
+are counter-read skew, all under 0.1% of `ps_recv`.
+
+The ceiling is a CPU wall, not a wait: at saturation the capture thread holds
+0.93–0.94 of a core, which at 1,694 packets/second is 553 microseconds each.
+The marginal cost derived from the unsaturated steps, with the idle baseline
+subtracted, is about 640 microseconds. One core divided by that cost is
+approximately the observed ceiling, which is what identifies the callback thread
+as the constraint.
+
+### `ps_drop` under-reports; trust the gap instead
+
+**A saturated capture reported `ps_drop` of zero while barely half the received
+packets reached the callback.** At 10,000 retained addresses and only 500
+packets/second offered, `ps_recv` was 15,838, `ps_drop` was 0, and 7,935 packets
+were counted — the missing 7,903 were sitting in Npcap's kernel buffer, draining
+at 264 packets/second. The buffer absorbs several seconds of backlog and reports
+nothing wrong until it fills; the consistent 3,000–9,000 `unproc` figure across
+the saturated rows matches a roughly 1 MB buffer at about 116 bytes per packet.
+
+Anything built on top of these counters must therefore treat **the gap between
+`ps_recv` and packets actually counted as the trustworthy loss signal**, not
+`ps_drop`. A monitor watching `ps_drop` alone reports perfect health through the
+entire period in which the buffer is filling, and only admits a problem once the
+capture is already many seconds behind. This compounds the failure described in
+[The callback guard is mandatory](#the-callback-guard-is-mandatory-not-defensive-habit):
+a capture running seconds behind real time draws every device as though it had
+gone quiet, and the drop counter agrees that nothing is wrong.
+
+### Parsing cost versus lock contention
+
+Which of the two binds depends entirely on how many addresses the aggregator has
+retained:
+
+- **At a handful of addresses, parsing cost binds outright.** The 1,694
+  packets/second ceiling is set by CPU in the callback, and polling costs 14–43
+  milliseconds without taking anything off the top.
+- **At 1,000 retained addresses, contention is already a 15% tax.** The ceiling
+  falls to 1,434 packets/second and poll latency roughly triples.
+- **At 10,000, contention wins completely** — an 88% collapse to about 200
+  packets/second. The tell is that the capture thread's CPU *falls*, from 0.94
+  of a core to 0.10: it is blocked on the lock rather than working. Poll latency
+  averages 660 milliseconds with a 1.44 second peak, so a 2 Hz poll demands
+  about 1.3 seconds of lock time per second and the aggregator is effectively
+  locked permanently.
+
+Two things about that are worth stating precisely. **Measuring `snapshot` in
+isolation understates the stall by four to five times** — around 100
+milliseconds at 1,000 addresses against 19 standalone, and 660 against 178 —
+because the GIL and the lock interact once a capture thread is competing for
+both, so an isolated snapshot benchmark is not a safe guide to what a poll costs
+in production. And the retained-address count at which this matters is low:
+degradation is measurable at 1,000 addresses and severe at 10,000.
+
+For the intended deployment — one tether, a handful of devices — parsing cost is
+the binding constraint. Contention is a second and much steeper cliff that opens
+only if address retention runs away, which is what interface derivation from the
+host address exists to prevent.
+
+### The `dpkt` trigger, and where its thresholds fall
+
+The trigger is: swapping parsing to `dpkt` is warranted if, at **twice the
+observed real-vehicle packet rate**, either `ps_drop / ps_recv` exceeds 0.001 or
+the capture thread exceeds about half a core.
+
+**It has not been evaluated.** Doing so requires a real vehicle rate from the
+hardware test, and none has been recorded. What the sweep fixes is where each
+half of the threshold falls, so the trigger can be applied the moment that number
+exists:
+
+- **Half a core** is crossed at about **730 packets/second** sustained
+  (interpolating 0.405 cores at 554 pps and 0.680 at 1,055). The CPU half
+  therefore fires at an observed vehicle rate above roughly **365
+  packets/second**.
+- **A drop ratio of 0.001** is crossed once offered load passes the ~1,700
+  packets/second service rate: zero drops at 1,055, 0.219 at 2,500 offered. The
+  drop half fires at an observed vehicle rate above roughly **850
+  packets/second**.
+
+The CPU half fires first, at about half the vehicle rate the drop half needs.
+
+**Profile before swapping the parser.** The sweep measures the whole userspace
+path without attributing cost within it, so it establishes the ceiling but not
+what sets it. If scapy's dissection really is 100–300 microseconds, then
+something else — scapy's per-packet socket and select loop, or the loopback
+datalink handling — accounts for the remainder of the 550–640 observed. `dpkt`
+replaces dissection only, so it may recover considerably less than the gap
+between 640 microseconds and dpkt's 2 implies. It is also not currently
+installed, making it a real new runtime dependency rather than a latent one.
+
+### How far these numbers transfer
+
+They bound the **userspace ceiling** — driver, kernel filter, scapy dissection,
+callback, aggregator — which is the question the measurement exists to answer.
+They do not transfer as absolute figures for the tether:
+
+- **Loopback is not Ethernet.** Npcap's loopback capture goes through the
+  Windows Filtering Platform with fabricated Ethernet headers. A physical NIC's
+  driver path, buffer sizing and drop accounting all differ.
+- **Packet size differed.** The generator sends 64-byte payloads; ROV video is
+  likely closer to 1,400-byte UDP. Scapy's cost is dominated by layer dissection
+  rather than payload length, so per-packet cost should be broadly comparable —
+  but that is an assumption, not a measurement, and a given bitrate at 1,400
+  bytes is far fewer packets.
+- **The buffer figure is this device's.** The roughly 9,000-packet backlog is
+  Npcap's default on the loopback adapter, and a physical adapter may differ.
 
 ## Breadcrumbs for macOS and Linux
 
