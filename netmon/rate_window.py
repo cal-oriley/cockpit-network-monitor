@@ -4,6 +4,10 @@ This module is the seam between the data source and everything above it: a
 packet-capture thread has nothing to say to the aggregator beyond "this IP
 sent a packet", which is exactly what :meth:`RateWindow.record` accepts.
 
+The window knows nothing about subnets. It keeps every address it has ever
+seen, and narrowing the view to one subnet is the server's job, so an address
+hidden by a subnet change comes back with its history intact.
+
 Time handling
 -------------
 The injectable ``clock`` is a *monotonic seconds* source, while the payload
@@ -26,6 +30,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 MS_PER_SECOND = 1000
 DEFAULT_BUCKET_MS = 250
@@ -125,11 +130,18 @@ class RateWindow:
             device.total_packets += packets
             device.last_packet_at = now
 
-    def snapshot(self) -> dict[str, object]:
+    def snapshot(self) -> dict[str, Any]:
         """Return the current window as the ``/api/rates`` payload body.
 
-        The caller adds the fields the aggregator cannot know: ``host_ip`` and
-        the capture status.
+        **Every** device's ring is advanced to the current tick, not only those
+        that recorded recently, so a silent device keeps returning a
+        full-length array that scrolls and fills with zeros from the right.
+        Advancing only inside :meth:`record` would freeze an idle device's
+        array at whatever it held when its last packet arrived, and a stalled
+        graph reads as a dead monitor rather than a dropout.
+
+        The caller adds the fields the aggregator cannot know: ``host_ip``,
+        ``subnet``, and the capture status.
         """
         with self._lock:
             now = self._clock()
@@ -160,8 +172,13 @@ class RateWindow:
 
     def _device_payload(
         self, ip: str, device: _DeviceState, tick: int, now: float
-    ) -> dict[str, object]:
-        """Render one device, oldest completed bucket first."""
+    ) -> dict[str, Any]:
+        """Render one device, oldest completed bucket first.
+
+        The ring is advanced to ``tick`` first, whether or not this device has
+        recorded anything since it was last read, which is what keeps a silent
+        device's trace marching leftward along the baseline.
+        """
         self._advance(device, tick)
         seconds_per_bucket = self._bucket_ms / MS_PER_SECOND
         pps = [

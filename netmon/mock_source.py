@@ -2,7 +2,9 @@
 
 The profiles below are chosen to exercise every state the UI has to render -
 steady, bursty, barely-there, dropping out, and arriving late - so the page can
-be built and reviewed without packet capture, elevation, or a vehicle.
+be built and reviewed without packet capture, elevation, or a vehicle. They
+span two subnets, because a filter with nothing outside the default subnet to
+hide cannot be reviewed at all.
 """
 
 import random
@@ -27,6 +29,10 @@ DROPOUT_SILENCE_S = 4.0
 LATE_PPS = 20.0
 LATE_JITTER = 0.15
 LATE_APPEARANCE_S = 8.0
+SECONDARY_STEADY_PPS = 16.0
+SECONDARY_STEADY_JITTER = 0.05
+SECONDARY_BURSTY_PPS = 120.0
+SECONDARY_BURSTY_JITTER = 0.6
 
 STOP_TIMEOUT_S = 2.0
 THREAD_NAME = "netmon-mock-source"
@@ -97,6 +103,18 @@ DEFAULT_MOCK_DEVICES: tuple[MockDevice, ...] = (
         base_pps=LATE_PPS,
         jitter=LATE_JITTER,
         appears_after_s=LATE_APPEARANCE_S,
+    ),
+    # A second subnet, so the page's subnet control has somewhere to switch to
+    # and the filter changes which rows are drawn rather than emptying the grid.
+    MockDevice(
+        ip="10.11.12.2",
+        base_pps=SECONDARY_STEADY_PPS,
+        jitter=SECONDARY_STEADY_JITTER,
+    ),
+    MockDevice(
+        ip="10.11.12.3",
+        base_pps=SECONDARY_BURSTY_PPS,
+        jitter=SECONDARY_BURSTY_JITTER,
     ),
 )
 

@@ -15,8 +15,10 @@ from .conftest import FakeClock
 
 BUCKET_MS = 250
 SMALL_BUCKETS = 4
+SCROLL_BUCKETS = 6
 BUCKET_S = BUCKET_MS / 1000
 DEVICE_IP = "192.168.2.2"
+OTHER_DEVICE_IP = "192.168.2.3"
 
 
 def make_window(clock: FakeClock, buckets: int = SMALL_BUCKETS) -> RateWindow:
@@ -27,6 +29,13 @@ def only_device(window: RateWindow) -> dict:
     devices = window.snapshot()["devices"]
     assert len(devices) == 1
     return devices[0]
+
+
+def pps_of(window: RateWindow, ip: str) -> list[float]:
+    devices = window.snapshot()["devices"]
+    matches = [device for device in devices if device["ip"] == ip]
+    assert matches, f"{ip} is not in the window"
+    return matches[0]["pps"]
 
 
 def test_geometry_is_reported_and_starts_empty(clock: FakeClock) -> None:
@@ -140,6 +149,76 @@ def test_quiet_device_stays_in_the_list_reporting_zeros(clock: FakeClock) -> Non
     assert device["ip"] == DEVICE_IP
     assert device["pps"] == [0.0] * SMALL_BUCKETS
     assert device["total_packets"] == 1
+
+
+def test_a_silent_window_scrolls_left_by_the_buckets_that_passed(
+    clock: FakeClock,
+) -> None:
+    """Wall-clock time, not traffic, is what moves a device's window along."""
+    window = make_window(clock, buckets=SCROLL_BUCKETS)
+    for packets in (1, 2, 3):
+        window.record(DEVICE_IP, packets)
+        clock.advance(BUCKET_S)
+    before = pps_of(window, DEVICE_IP)
+
+    shift = 2
+    clock.advance(shift * BUCKET_S)
+    after = pps_of(window, DEVICE_IP)
+
+    assert len(after) == len(before)
+    assert after == before[shift:] + [0.0] * shift
+
+
+def test_every_device_scrolls_not_only_the_ones_recording(
+    clock: FakeClock,
+) -> None:
+    window = make_window(clock, buckets=SCROLL_BUCKETS)
+    for ip in (DEVICE_IP, OTHER_DEVICE_IP):
+        window.record(ip, 4)
+    clock.advance(BUCKET_S)
+    before = pps_of(window, DEVICE_IP)
+
+    shift = 3
+    for _ in range(shift):
+        window.record(OTHER_DEVICE_IP, 4)
+        clock.advance(BUCKET_S)
+
+    assert pps_of(window, DEVICE_IP) == before[shift:] + [0.0] * shift
+    assert pps_of(window, OTHER_DEVICE_IP)[-1] == 16.0
+
+
+def test_a_device_silent_for_a_whole_window_reports_zeros_not_a_stale_array(
+    clock: FakeClock,
+) -> None:
+    window = make_window(clock, buckets=SCROLL_BUCKETS)
+    window.record(DEVICE_IP, 9)
+    clock.advance(BUCKET_S)
+    assert only_device(window)["peak_pps"] == 36.0
+
+    clock.advance(SCROLL_BUCKETS * BUCKET_S)
+    device = only_device(window)
+
+    assert device["pps"] == [0.0] * SCROLL_BUCKETS
+    assert device["current_pps"] == 0.0
+    assert device["peak_pps"] == 0.0
+    assert device["total_packets"] == 9
+
+
+def test_a_device_quiet_since_its_first_packet_still_moves_with_the_clock(
+    clock: FakeClock,
+) -> None:
+    """A device seen once at startup and never again must not freeze."""
+    window = make_window(clock, buckets=SCROLL_BUCKETS)
+    window.record(DEVICE_IP)
+    clock.advance(3600.0)
+    first = window.snapshot()
+
+    clock.advance(2 * BUCKET_S)
+    second = window.snapshot()
+
+    assert second["now_ms"] == first["now_ms"] + 2 * BUCKET_MS
+    for snapshot in (first, second):
+        assert snapshot["devices"][0]["pps"] == [0.0] * SCROLL_BUCKETS
 
 
 def test_peak_is_the_maximum_across_the_window(clock: FakeClock) -> None:

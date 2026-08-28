@@ -5,6 +5,7 @@ every state it has to render, so these tests drive its schedule with a fake
 clock and assert the behaviours the prototype depends on.
 """
 
+import ipaddress
 import random
 import threading
 import time
@@ -33,6 +34,15 @@ LATE_DEVICE_IP = "192.168.2.10"
 DROPOUT_DEVICE_IP = "192.168.2.5"
 QUIET_DEVICE_IP = "192.168.2.4"
 TELEMETRY_DEVICE_IP = "192.168.2.2"
+VIDEO_DEVICE_IP = "192.168.2.3"
+SECONDARY_STEADY_IP = "10.11.12.2"
+SECONDARY_BURSTY_IP = "10.11.12.3"
+
+DEFAULT_SUBNET = ipaddress.ip_network("192.168.2.0/24")
+SECOND_SUBNET = ipaddress.ip_network("10.11.12.0/24")
+DEFAULT_SUBNET_DEVICES = 5
+SECOND_SUBNET_DEVICES = 2
+PROFILE_SAMPLE_S = 10.0
 
 # A rate that divides evenly into a bucket, so no coin flip is involved.
 EXACT_PPS = 8.0
@@ -70,11 +80,42 @@ def addresses(window: RateWindow) -> list[str]:
     return [device["ip"] for device in window.snapshot()["devices"]]
 
 
-def test_default_profiles_cover_five_distinct_devices() -> None:
-    ips = [device.ip for device in DEFAULT_MOCK_DEVICES]
+def relative_spread(rates: list[float]) -> float:
+    """How far a trace swings, as a fraction of its own peak."""
+    peak = max(rates)
+    assert peak > 0.0
+    return (peak - min(rates)) / peak
 
-    assert len(ips) == 5
-    assert len(set(ips)) == 5
+
+def test_default_profiles_are_distinct_and_span_two_subnets() -> None:
+    ips = [device.ip for device in DEFAULT_MOCK_DEVICES]
+    addresses = [ipaddress.ip_address(ip) for ip in ips]
+
+    assert len(set(ips)) == len(ips)
+    assert sum(a in DEFAULT_SUBNET for a in addresses) == DEFAULT_SUBNET_DEVICES
+    assert sum(a in SECOND_SUBNET for a in addresses) == SECOND_SUBNET_DEVICES
+
+
+def test_second_subnet_devices_send_from_the_first_tick(clock: FakeClock) -> None:
+    window, source = build_source(clock)
+
+    source.tick()
+    clock.advance(BUCKET_S)
+
+    for ip in (SECONDARY_STEADY_IP, SECONDARY_BURSTY_IP):
+        assert device_named(window, ip)["total_packets"] > 0
+
+
+def test_the_second_subnet_profiles_are_visibly_different(clock: FakeClock) -> None:
+    """One steady trace and one bursty one, so the swap is worth looking at."""
+    window, source = build_source(clock)
+
+    run_ticks(clock, source, PROFILE_SAMPLE_S)
+    steady = device_named(window, SECONDARY_STEADY_IP)["pps"]
+    bursty = device_named(window, SECONDARY_BURSTY_IP)["pps"]
+
+    assert max(bursty) > max(steady)
+    assert relative_spread(bursty) > relative_spread(steady)
 
 
 def test_late_device_appears_only_after_its_delay(clock: FakeClock) -> None:
@@ -94,9 +135,11 @@ def test_other_devices_are_present_from_the_first_tick(clock: FakeClock) -> None
 
     assert set(addresses(window)) == {
         TELEMETRY_DEVICE_IP,
-        "192.168.2.3",
+        VIDEO_DEVICE_IP,
         QUIET_DEVICE_IP,
         DROPOUT_DEVICE_IP,
+        SECONDARY_STEADY_IP,
+        SECONDARY_BURSTY_IP,
     }
 
 
