@@ -7,38 +7,61 @@ for ROV operators, to be embedded as a panel in Blue Robotics Cockpit.
 
 ## Build / Test / Run
 
-- **Build:** nothing to build — pure Python, standard library only in Phase 1.
+- **Build:** nothing to build — pure Python.
 - **Test:** `pytest`
-- **Run / dev:** `python -m netmon.server --mock`
+- **Run (real capture):** `python -m netmon.server` — needs Npcap installed and
+an adapter holding `--host-ip`.
+- **Run (no hardware):** `python -m netmon.server --mock` — synthetic traffic,
+no Npcap and no elevation needed. This is the mode to use for UI work.
+- `--port 8080` will not bind on this machine; another process holds it. Pass
+`--port 8765` or similar.
 
 ## Code Style
 
 - Python. `snake_case` for modules, functions, and variables; `PascalCase` for
 classes; `UPPER_SNAKE_CASE` for constants.
-- No dependencies beyond the standard library in Phase 1. `pytest` is the only
-dev dependency; scapy arrives with Phase 2.
+- `scapy` is the only runtime dependency, pinned below 2.8 because the
+drop-counter read reaches through private scapy internals. `pytest` is the only
+dev dependency. Everything else is standard library and should stay that way.
+- Import scapy **lazily, inside the functions that need it** — never at module
+scope. `--mock` must keep working without scapy installed, the pure-logic tests
+must run without it, and `import scapy.all` costs seconds of arch
+initialization.
 
 ## Architecture
 
-- `netmon/rate_window.py` — thread-safe rolling-window aggregator. This is the
-Phase 1 / Phase 2 seam: Phase 2 only changes who calls `RateWindow.record`.
+- `netmon/rate_window.py` — thread-safe rolling-window aggregator, deliberately
+subnet-agnostic. It retains every address it has ever seen and advances every
+device's window with the clock, so a silent device scrolls along the baseline
+rather than freezing.
+- `netmon/capture.py` — the passive scapy-over-Npcap listener. Owns
+`CaptureStatus`, derives the capture interface from `--host-ip`, and reads
+dropped-packet counts. Its packet callback is deliberately incapable of
+raising: an exception there kills the whole capture silently, which would render
+as every device flatlining.
 - `netmon/mock_source.py` — synthetic traffic generator feeding the aggregator.
+Interchangeable with the capture source: both expose
+`start`/`stop`/`running`/`status`.
 - `netmon/server.py` — stdlib `ThreadingHTTPServer` serving the `web/` directory
 plus a `GET /api/rates` JSON endpoint, polled at 2 Hz by the browser. Owns
 subnet filtering: the aggregator stays subnet-agnostic and the endpoint filters
 on read, so the subnet is a parameter of the request rather than server state.
 - `web/` — dark-themed single-page UI. Hand-rolled `<canvas>` graphs, no
 libraries and no external resources.
-- `tests/` — pytest unit tests.
-- `docs/capture-feasibility.md` — Phase 2 packet-capture research.
+- `tests/` — pytest unit tests. Capture is tested by injecting a fake sniffer at
+the trust boundary, so the whole suite runs with no hardware and no Npcap.
+- `tools/benchmark_capture.py` — measures the capture path's sustained
+packets/second, dropped-packet counts and CPU cost.
+- `docs/capture-feasibility.md` — packet-capture research and measured results.
 - Runtime target: a Windows topside laptop at `192.168.2.1`. The page is
 designed to be embedded as an iframe panel in Blue Robotics Cockpit.
 
 ## IRL Testing
 
-- **Required?** Not for Phase 1 — it runs on mock data on a dev laptop, with no
-elevation and no Npcap. **Yes for Phase 2**, which captures real packets.
-- **Hardware / setup (Phase 2):** this development machine, which already has
+- **Required?** **Yes** — real packet capture is in the default run path and can
+only be confirmed against a real vehicle. `--mock` needs no IRL testing: it runs
+on synthetic data with no elevation and no Npcap.
+- **Hardware / setup:** this development machine, which already has
 Administrator access and Npcap 1.86 installed. The vehicle connects over the
 tether to the **laptop's Ethernet port**, with that adapter statically set to
 `192.168.2.1` and the ROV at `192.168.2.2`.
@@ -63,6 +86,8 @@ such as starting the video stream, `capture.state` reads `ok`, and no dropped
 packets are reported.
 - **Who does what:** the developer performs and confirms every IRL step; agents
 produce the procedure and never claim an IRL test passed.
-- **IRL-facing paths:** `netmon/capture.py` (does not exist yet — arrives in
-Phase 2).
+- **IRL-facing paths:** `netmon/capture.py`, and `netmon/server.py`'s source
+selection in `main()`. Note the tether adapter does **not** currently hold
+`192.168.2.1`, so a real run reports `interface_missing` until that static
+address is restored — the first step of the procedure above.
 
