@@ -22,23 +22,15 @@ monitor exists to catch:
 The generator's own send count is recorded too, so offered load is a
 measurement rather than an assumption.
 
-Lock contention may matter more than parsing cost. :meth:`RateWindow.snapshot`
-is O(devices x buckets) and holds the lock :meth:`RateWindow.record` needs, so
-every poll stalls the capture callback. The sweep therefore repeats at several
-retained-address counts with a 2 Hz poller running against a real
-``/api/rates`` endpoint, which is what would reframe the performance story away
-from scapy before anyone reaches for a faster parser.
+Lock contention may matter more than parsing cost, so the sweep repeats at
+several retained-address counts with a 2 Hz poller running against a real
+``/api/rates`` endpoint - see :func:`run_group`.
 
 **What this does and does not bound.** Loopback packet sizes and datalink
 differ from real Ethernet and drop accounting may behave differently from a
 physical NIC, so the absolute numbers do not transfer. What transfers is the
 userspace ceiling - driver to kernel filter to scapy dissection to our callback
 to the aggregator - which is the question being asked.
-
-Usage::
-
-    python tools/benchmark_capture.py sweep --output-dir results
-    python tools/benchmark_capture.py selfcheck
 """
 
 import argparse
@@ -69,6 +61,9 @@ from netmon.rate_window import RateWindow  # noqa: E402
 from netmon.server import RatesRequestHandler, parse_subnet  # noqa: E402
 
 WINDOWS_PLATFORM = "win32"
+
+# One reading of the three counters, any of which may be unavailable.
+Counters = tuple[int | None, int | None, float | None]
 
 # The 0 pps step is the baseline that makes the CPU figure readable: it
 # separates what the capture thread costs merely by waiting from what it costs
@@ -115,6 +110,7 @@ THREAD_QUERY_LIMITED_INFORMATION = 0x0800
 
 RESULT_FILENAME = "capture-benchmark-{stamp}"
 STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
+NO_SAMPLES_ERROR = "fewer than two samples were taken"
 
 HEADER_FORMAT = (
     "{preload:>8} {rate:>7} {sent:>9} {counted:>9} {counted_pps:>9} "
@@ -151,29 +147,33 @@ class Sample:
 
 @dataclass
 class StepResult:
-    """What one offered-load step measured."""
+    """What one offered-load step measured.
+
+    Every measured field defaults to absent, so a step that failed reports
+    what it did observe rather than inventing zeroes for the rest.
+    """
 
     preload_addresses: int
     offered_pps: int
-    duration_s: float
-    sent: int | None
-    sent_pps: float | None
-    counted: int
-    counted_pps: float
-    loss_vs_sent: float | None
-    ps_recv: int | None
-    ps_drop: int | None
-    drop_ratio: float | None
-    peak_interval_drop_ratio: float | None
-    recv_minus_counted: int | None
-    capture_cpu_s: float | None
-    capture_cpu_cores: float | None
-    polls: int
-    poll_mean_ms: float | None
-    poll_max_ms: float | None
-    poll_failures: int
     capture_state: str
-    error: str | None
+    duration_s: float = 0.0
+    sent: int | None = None
+    sent_pps: float | None = None
+    counted: int = 0
+    counted_pps: float = 0.0
+    loss_vs_sent: float | None = None
+    ps_recv: int | None = None
+    ps_drop: int | None = None
+    drop_ratio: float | None = None
+    peak_interval_drop_ratio: float | None = None
+    recv_minus_counted: int | None = None
+    capture_cpu_s: float | None = None
+    capture_cpu_cores: float | None = None
+    polls: int = 0
+    poll_mean_ms: float | None = None
+    poll_max_ms: float | None = None
+    poll_failures: int = 0
+    error: str | None = None
 
 
 class CountingWindow(RateWindow):
@@ -298,29 +298,20 @@ def summarize_step(
     error: str | None = None,
 ) -> StepResult:
     """Reduce a step's samples to the row that goes in the results table."""
+    polling = {
+        "polls": len(poll_latencies_ms),
+        "poll_mean_ms": _rounded(_mean(poll_latencies_ms), 1),
+        "poll_max_ms": _rounded(max(poll_latencies_ms, default=None), 1),
+        "poll_failures": poll_failures,
+    }
     if len(samples) < 2:
         return StepResult(
             preload_addresses=preload_addresses,
             offered_pps=offered_pps,
-            duration_s=0.0,
-            sent=sent,
-            sent_pps=None,
-            counted=0,
-            counted_pps=0.0,
-            loss_vs_sent=None,
-            ps_recv=None,
-            ps_drop=None,
-            drop_ratio=None,
-            peak_interval_drop_ratio=None,
-            recv_minus_counted=None,
-            capture_cpu_s=None,
-            capture_cpu_cores=None,
-            polls=len(poll_latencies_ms),
-            poll_mean_ms=_mean(poll_latencies_ms),
-            poll_max_ms=max(poll_latencies_ms, default=None),
-            poll_failures=poll_failures,
             capture_state=capture_state,
-            error=error or "fewer than two samples were taken",
+            sent=sent,
+            error=error or NO_SAMPLES_ERROR,
+            **polling,
         )
 
     first, last = samples[0], samples[-1]
@@ -347,13 +338,15 @@ def summarize_step(
         capture_cpu_cores=_rounded(
             None if cpu_s is None else rate_per_second(cpu_s, duration_s), 3
         ),
-        polls=len(poll_latencies_ms),
-        poll_mean_ms=_rounded(_mean(poll_latencies_ms), 1),
-        poll_max_ms=_rounded(max(poll_latencies_ms, default=None), 1),
-        poll_failures=poll_failures,
         capture_state=capture_state,
         error=error,
+        **polling,
     )
+
+
+def _listed(values: Sequence[int]) -> str:
+    """Default sequence as it appears in ``--help``."""
+    return " ".join(str(value) for value in values)
 
 
 def _mean(values: Sequence[float]) -> float | None:
@@ -427,9 +420,7 @@ def thread_cpu_seconds(native_id: int | None) -> float | None:
         kernel32.CloseHandle(ctypes.c_void_p(handle))
 
 
-def read_counters(source: capture.CaptureSource) -> tuple[
-    int | None, int | None, float | None
-]:
+def read_counters(source: capture.CaptureSource) -> Counters:
     """``(ps_recv, ps_drop, cpu_seconds)`` for a live capture.
 
     The drop counters are read by :mod:`netmon.capture`'s own reader rather
@@ -498,12 +489,7 @@ class RatesPoller(threading.Thread):
 
 
 def run_blaster(
-    script: Path,
-    rate_pps: int,
-    duration_s: float,
-    target_ip: str,
-    target_port: int,
-    payload_bytes: int,
+    script: Path, rate_pps: int, args: argparse.Namespace
 ) -> subprocess.Popen[str]:
     """Start the UDP generator in its own process and wait for it to be ready.
 
@@ -514,25 +500,11 @@ def run_blaster(
     clock - otherwise the measurement window is offset from the traffic by a
     few hundred milliseconds and the offered load looks partly lost.
     """
+    command = [sys.executable, str(script), "blast", "--rate", str(rate_pps)]
+    for name in ("duration", "target_ip", "target_port", "payload_bytes"):
+        command += [f"--{name.replace('_', '-')}", str(getattr(args, name))]
     process = subprocess.Popen(
-        [
-            sys.executable,
-            str(script),
-            "blast",
-            "--rate",
-            str(rate_pps),
-            "--duration",
-            str(duration_s),
-            "--target-ip",
-            target_ip,
-            "--target-port",
-            str(target_port),
-            "--payload-bytes",
-            str(payload_bytes),
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
     )
     assert process.stdout is not None
     if process.stdout.readline().strip() != READY_LINE:
@@ -573,14 +545,7 @@ def run_step(
 ) -> StepResult:
     """Drive one offered-load step and return its measured row."""
     poller.take()
-    process = run_blaster(
-        script,
-        rate_pps,
-        args.duration,
-        args.target_ip,
-        args.target_port,
-        args.payload_bytes,
-    )
+    process = run_blaster(script, rate_pps, args)
     samples: list[Sample] = []
     started = time.perf_counter()
     deadline = started + args.duration
@@ -616,14 +581,31 @@ def run_step(
     )
 
 
+def _failed_step(
+    preload: int, rate_pps: int, capture_state: str, error: str
+) -> StepResult:
+    """A step that produced no measurement, recorded rather than dropped."""
+    return StepResult(
+        preload_addresses=preload,
+        offered_pps=rate_pps,
+        capture_state=capture_state,
+        error=error,
+    )
+
+
 def run_group(
     preload: int, args: argparse.Namespace, script: Path
 ) -> list[StepResult]:
     """Run every offered-load step against one retained-address count.
 
+    :meth:`RateWindow.snapshot` is O(devices x buckets) and holds the lock
+    :meth:`RateWindow.record` needs, so every poll stalls the capture callback
+    for as long as it takes to walk the history. Comparing groups is what says
+    whether that, rather than scapy's parsing, is the binding constraint.
+
     The capture, the aggregator and the HTTP server are rebuilt per group so
-    the drop counters start from zero and the only variable between groups is
-    how much history :meth:`RateWindow.snapshot` has to walk.
+    the drop counters start from zero and the retained-address count is the
+    only variable between them.
     """
     window = CountingWindow()
     for address in preload_addresses(preload):
@@ -657,16 +639,7 @@ def run_group(
         if status.state != capture.CAPTURE_STATE_OK:
             print(f"  capture unhealthy: {status.state} - {status.detail}")
             return [
-                summarize_step(
-                    preload_addresses=preload,
-                    offered_pps=rate,
-                    samples=[],
-                    sent=None,
-                    poll_latencies_ms=[],
-                    poll_failures=0,
-                    capture_state=status.state,
-                    error=status.detail,
-                )
+                _failed_step(preload, rate, status.state, status.detail)
                 for rate in args.rates
             ]
         time.sleep(CAPTURE_WARMUP_S)
@@ -679,15 +652,11 @@ def run_group(
             except Exception as error:
                 # One bad step is a gap in the curve, not a reason to abandon
                 # the ten minutes of sweep still to come.
-                result = summarize_step(
-                    preload_addresses=preload,
-                    offered_pps=rate,
-                    samples=[],
-                    sent=None,
-                    poll_latencies_ms=[],
-                    poll_failures=0,
-                    capture_state=source.status().state,
-                    error=f"{type(error).__name__}: {error}",
+                result = _failed_step(
+                    preload,
+                    rate,
+                    source.status().state,
+                    f"{type(error).__name__}: {error}",
                 )
             results.append(result)
             print(format_row(result), flush=True)
@@ -952,7 +921,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=list(DEFAULT_RATES_PPS),
         metavar="PPS",
-        help=f"offered loads to step through (default: {' '.join(map(str, DEFAULT_RATES_PPS))})",
+        help=f"offered loads to step through (default: {_listed(DEFAULT_RATES_PPS)})",
     )
     sweep.add_argument(
         "--duration",
@@ -967,11 +936,8 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=list(DEFAULT_PRELOAD_ADDRESSES),
         metavar="N",
-        help=(
-            "retained address counts to repeat the sweep at, which is what "
-            "exposes snapshot lock contention (default: "
-            f"{' '.join(map(str, DEFAULT_PRELOAD_ADDRESSES))})"
-        ),
+        help="retained address counts to repeat the sweep at, which is what "
+        f"exposes snapshot lock contention (default: {_listed(DEFAULT_PRELOAD_ADDRESSES)})",
     )
     sweep.add_argument(
         "--iface",
@@ -987,11 +953,9 @@ def build_parser() -> argparse.ArgumentParser:
     sweep.add_argument(
         "--subnet",
         default=DEFAULT_SUBNET,
-        help=(
-            "subnet the poller's response is narrowed to; the default excludes "
-            "the preloaded addresses so the measurement isolates lock "
-            f"contention from response size (default: {DEFAULT_SUBNET})"
-        ),
+        help="subnet the poller's response is narrowed to; the default excludes "
+        "the preloaded addresses, so the measurement isolates lock contention "
+        f"from response size (default: {DEFAULT_SUBNET})",
     )
     sweep.add_argument(
         "--output-dir",
@@ -1023,10 +987,8 @@ def _add_traffic_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--target-ip",
         default=DEFAULT_TARGET_IP,
-        help=(
-            "destination of the generated packets, which is also the address "
-            f"the capture filters on (default: {DEFAULT_TARGET_IP})"
-        ),
+        help="destination of the generated packets, which is also the address "
+        f"the capture filters on (default: {DEFAULT_TARGET_IP})",
     )
     parser.add_argument(
         "--target-port",
