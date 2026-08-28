@@ -17,6 +17,10 @@ BUCKET_MS = 250
 SMALL_BUCKETS = 4
 SCROLL_BUCKETS = 6
 BUCKET_S = BUCKET_MS / 1000
+# The ring keeps one slot beyond the reported window for the tick in progress,
+# so a value only comes back around into the read window after more than
+# ``buckets + 1`` silent ticks - and lands off the one slot the read skips.
+WRAPAROUND_SILENT_BUCKETS = SCROLL_BUCKETS + 3
 DEVICE_IP = "192.168.2.2"
 OTHER_DEVICE_IP = "192.168.2.3"
 
@@ -202,6 +206,29 @@ def test_a_device_silent_for_a_whole_window_reports_zeros_not_a_stale_array(
     assert device["current_pps"] == 0.0
     assert device["peak_pps"] == 0.0
     assert device["total_packets"] == 9
+
+
+def test_an_old_burst_never_wraps_back_into_view_while_a_device_is_silent(
+    clock: FakeClock,
+) -> None:
+    """Silence long enough to wrap the ring must still read as zeros.
+
+    The ring is only as long as the window plus the tick in progress, so its
+    slots are reused. Stay quiet for longer than that and the slot holding the
+    burst is addressed again from the far side of the wrap - which is where a
+    ring advanced only by ``record`` hands the UI a value from a minute ago as
+    if it had just arrived.
+    """
+    window = make_window(clock, buckets=SCROLL_BUCKETS)
+    window.record(DEVICE_IP, 9)
+    clock.advance(BUCKET_S)
+    assert max(pps_of(window, DEVICE_IP)) == 36.0
+
+    clock.advance(WRAPAROUND_SILENT_BUCKETS * BUCKET_S)
+    pps = pps_of(window, DEVICE_IP)
+
+    assert len(pps) == SCROLL_BUCKETS
+    assert pps == [0.0] * SCROLL_BUCKETS
 
 
 def test_a_device_quiet_since_its_first_packet_still_moves_with_the_clock(

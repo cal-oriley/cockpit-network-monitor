@@ -54,6 +54,10 @@ BUCKET_S = BUCKET_MS / 1000
 WINDOW_BUCKETS = 8
 PACKETS_PER_BUCKET = 3
 
+INDEX_PATH = "/"
+HTML_CONTENT_TYPE = "text/html"
+PAGE_TITLE_MARKUP = "<title>Subnet Traffic</title>"
+
 LOOPBACK = "127.0.0.1"
 EPHEMERAL_PORT = 0
 REQUEST_TIMEOUT_S = 5.0
@@ -137,6 +141,17 @@ def _decode(status: int, headers: Message, body: bytes) -> Response:
     )
 
 
+def fetch_index(base_url: str) -> tuple[int, str, str]:
+    """GET the served page, returning its status, content type, and markup."""
+    url = f"{base_url}{INDEX_PATH}"
+    with urllib.request.urlopen(url, timeout=REQUEST_TIMEOUT_S) as answer:
+        return (
+            answer.status,
+            answer.headers.get("Content-Type", ""),
+            answer.read().decode("utf-8"),
+        )
+
+
 def served_ips(response: Response) -> list[str]:
     return [device["ip"] for device in response.body["devices"]]
 
@@ -183,6 +198,16 @@ def test_web_directory_is_resolved_from_the_package_not_the_cwd() -> None:
 
     assert server.WEB_DIRECTORY.is_absolute()
     assert server.WEB_DIRECTORY == package_root.parent / "web"
+
+
+def test_the_root_path_serves_the_page_itself(clock: FakeClock) -> None:
+    """The UI is reachable at ``/`` with ``index.html`` as the index."""
+    with serving(populated_window(clock)) as base_url:
+        status, content_type, markup = fetch_index(base_url)
+
+    assert status == HTTPStatus.OK
+    assert content_type.startswith(HTML_CONTENT_TYPE)
+    assert PAGE_TITLE_MARKUP in markup
 
 
 @pytest.mark.parametrize(

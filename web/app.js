@@ -32,10 +32,9 @@
   const SUBNET_QUERY_PARAM = 'subnet';
   const SUBNET_STORAGE_KEY = 'netmon.subnet';
 
-  /* Shape check only, used to reject junk read back out of localStorage. The
-     server is the authority on what a valid subnet is, and answers anything it
-     dislikes with a sentence worth showing. */
-  const SUBNET_SHAPE = /^\d{1,3}(?:\.\d{1,3}){3}\/\d{1,2}$/;
+  /* Comfortably past the longest real CIDR - a full IPv6 address plus its
+     prefix - so only obvious junk read back out of storage is turned away. */
+  const MAX_SUBNET_CHARS = 64;
 
   /* capture.state values this page reacts to. Every other value - including
      ones a later phase invents - falls through to the warning banner, which is
@@ -292,41 +291,54 @@
   // ── Subnet control ──────────────────────────────────────────────────────
 
   /**
-   * Read the last committed subnet back out of storage.
+   * Read the last accepted subnet back out of storage.
    *
    * Storage can be unavailable altogether inside an iframe, and what it holds
-   * is whatever a previous session or another page left there, so anything that
-   * is not subnet-shaped is treated as absent: startup falls back to the
-   * server's default rather than breaking.
+   * is whatever a previous session or another page left there, so only a
+   * non-empty string of sensible length is taken at all. Whether it still names
+   * a usable subnet is the server's call, answered with a sentence worth
+   * showing beside the field.
    */
   function loadStoredSubnet() {
     try {
       const stored = window.localStorage.getItem(SUBNET_STORAGE_KEY);
-      return typeof stored === 'string' && SUBNET_SHAPE.test(stored) ? stored : null;
+      if (typeof stored !== 'string') return null;
+      const subnet = stored.trim();
+      return subnet && subnet.length <= MAX_SUBNET_CHARS ? subnet : null;
     } catch (error) {
       return null;
     }
   }
 
-  /** Persist only plausible values, so a reload never starts in an error state. */
+  /** Remember a subnet across page loads; storage may not be available at all. */
   function storeSubnet(subnet) {
     try {
-      if (SUBNET_SHAPE.test(subnet)) window.localStorage.setItem(SUBNET_STORAGE_KEY, subnet);
-      else window.localStorage.removeItem(SUBNET_STORAGE_KEY);
+      /* Read before writing: every poll confirms the same subnet, and there is
+         no reason to hand storage a value it already holds. */
+      if (window.localStorage.getItem(SUBNET_STORAGE_KEY) === subnet) return;
+      window.localStorage.setItem(SUBNET_STORAGE_KEY, subnet);
     } catch (error) {
       /* Nothing to recover: the subnet still applies for this session. */
     }
   }
 
   /**
-   * Show the field the effective subnet the payload was filtered to, so the
-   * header reflects the server's normalized answer rather than what was typed.
-   * Skipped while the field has focus, so a poll cannot overwrite an edit in
-   * progress.
+   * Accept the effective subnet the payload was filtered to: show it in the
+   * field, ask for it by name from here on, and remember it for the next load.
+   * The server normalized it while answering a request it accepted, so it is
+   * both canonical and known-good - a reload cannot come back up in an error
+   * state, and a value the server merely reformatted is still kept.
+   *
+   * The field is left alone while it has focus, so a poll cannot overwrite an
+   * edit in progress, and the server's own default is shown but never stored,
+   * so changing that default still reaches a returning page.
    */
-  function renderSubnet(subnet) {
+  function acceptSubnet(subnet) {
     if (typeof subnet !== 'string' || !subnet) return;
     if (document.activeElement !== els.subnet) els.subnet.value = subnet;
+    if (requestedSubnet === null) return;
+    requestedSubnet = subnet;
+    storeSubnet(subnet);
   }
 
   function showSubnetError(sentence) {
@@ -351,7 +363,6 @@
     const subnet = els.subnet.value.trim();
     if (subnet === requestedSubnet) return;
     requestedSubnet = subnet;
-    storeSubnet(subnet);
     nextDelayMs = POLL_INTERVAL_MS;
     scheduleNextPoll(IMMEDIATE_POLL_MS);
   }
@@ -364,7 +375,7 @@
     els.subnet.addEventListener('change', commitSubnet);
     els.subnet.addEventListener('keydown', (event) => {
       /* Leaving the field on Enter lets the normalized subnet render straight
-         back into it, since renderSubnet holds off while it is focused. */
+         back into it, since acceptSubnet holds off while it is focused. */
       if (event.key === 'Enter') els.subnet.blur();
     });
   }
@@ -523,11 +534,14 @@
 
   function applyPayload(payload) {
     renderCaptureStatus(payload.capture);
-    renderSubnet(payload.subnet);
+    acceptSubnet(payload.subnet);
     renderAxis(readWindowMs(payload));
-    const devices = Array.isArray(payload.devices) ? payload.devices : [];
-    const deviceCount = reconcileRows(devices);
-    updateHeader(payload, deviceCount);
+    /* An empty list is a real answer - nothing has been seen yet, or nothing in
+       this subnet - and empties the grid accordingly. A `devices` that is
+       missing or not a list is instead a payload this page cannot read, so the
+       last good rows stay up, exactly as they do when a subnet is rejected. */
+    if (!Array.isArray(payload.devices)) return;
+    updateHeader(payload, reconcileRows(payload.devices));
   }
 
   async function pollOnce() {
