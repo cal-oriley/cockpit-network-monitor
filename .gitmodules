@@ -1,0 +1,4 @@
+[submodule ".cursor/rules/cursor-rules"]
+	path = .cursor/rules/cursor-rules
+	url = https://github.com/cal-oriley/cursor-rules.git
+	branch = dist
