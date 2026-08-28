@@ -28,6 +28,7 @@ import pytest
 from netmon import server
 from netmon.capture import (
     CAPTURE_STATE_CAPTURE_DIED,
+    CAPTURE_STATE_DROPPING_PACKETS,
     CAPTURE_STATE_NOT_RUNNING,
     CAPTURE_STATE_OK,
     CaptureSource,
@@ -296,7 +297,12 @@ def test_unknown_states_are_accepted_and_described() -> None:
 
 
 @pytest.mark.parametrize(
-    "state", [CAPTURE_STATE_CAPTURE_DIED, CAPTURE_STATE_NOT_RUNNING]
+    "state",
+    [
+        CAPTURE_STATE_CAPTURE_DIED,
+        CAPTURE_STATE_NOT_RUNNING,
+        CAPTURE_STATE_DROPPING_PACKETS,
+    ],
 )
 def test_the_states_only_a_running_capture_produces_can_be_reviewed(
     state: str,

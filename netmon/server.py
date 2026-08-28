@@ -22,6 +22,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from .capture import (
     CAPTURE_STATE_CAPTURE_DIED,
+    CAPTURE_STATE_DROPPING_PACKETS,
     CAPTURE_STATE_ERROR,
     CAPTURE_STATE_INTERFACE_MISSING,
     CAPTURE_STATE_NEEDS_ELEVATION,
@@ -87,6 +88,10 @@ CAPTURE_STATE_DETAILS: dict[str, str] = {
     CAPTURE_STATE_CAPTURE_DIED: (
         "Packet capture stopped unexpectedly after starting, so these rates "
         "are no longer live; restart this program."
+    ),
+    CAPTURE_STATE_DROPPING_PACKETS: (
+        "Packets are reaching the capture driver faster than they can be "
+        "counted, so every rate shown here is undercounted."
     ),
     CAPTURE_STATE_ERROR: "Packet capture failed.",
 }

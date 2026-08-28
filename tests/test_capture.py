@@ -17,12 +17,14 @@ import importlib.util
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from netmon import capture
 from netmon.capture import (
     CAPTURE_STATE_CAPTURE_DIED,
+    CAPTURE_STATE_DROPPING_PACKETS,
     CAPTURE_STATE_ERROR,
     CAPTURE_STATE_INTERFACE_MISSING,
     CAPTURE_STATE_NEEDS_ELEVATION,
@@ -37,6 +39,8 @@ from netmon.capture import (
     derive_state,
     extract_source_ip,
     filter_for,
+    is_losing_packets,
+    packets_lost,
     select_interface,
 )
 from netmon.rate_window import RateWindow
@@ -59,6 +63,16 @@ PERMISSION_MESSAGE = (
 FAILURE_MESSAGE = "libpcap said no"
 SHORT_START_TIMEOUT_S = 0.1
 TRUNCATED_FRAME = b"\x00" * 20
+
+# Large enough that a handful of lost packets sits below the tolerance and a
+# tenth of them sits well above it, so both sides of the ratio are reachable.
+RECEIVED_SAMPLE = 10_000
+BELOW_TOLERANCE_COUNTED = 9_995
+AT_TOLERANCE_COUNTED = 9_990
+ABOVE_TOLERANCE_COUNTED = 9_000
+# Deliberately unequal to the packets actually lost, so the two numbers in the
+# sentence cannot be confused for one another.
+DRIVER_DROPPED = 400
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -201,6 +215,16 @@ def build_source(
 
 def recorded_addresses(window: RateWindow) -> list[str]:
     return [device["ip"] for device in window.snapshot()["devices"]]
+
+
+def feed_packets(
+    sniffer: FakeSniffer, count: int, packet: FakePacket | None = None
+) -> None:
+    """Push ``count`` packets through the capture callback."""
+    if packet is None:
+        packet = FakePacket(IP=FakeLayer(DEVICE_IP))
+    for _ in range(count):
+        sniffer.on_packet(packet)
 
 
 class FakeInterface:
@@ -699,33 +723,188 @@ def test_unattributable_packets_are_counted_and_surfaced(
 
 
 # --------------------------------------------------------------------------
-# Driver drop counters
+# Packet loss
 # --------------------------------------------------------------------------
 
 
-def test_dropped_packets_are_reported_while_capture_is_healthy(
+@pytest.mark.parametrize(
+    "received,counted,expected",
+    [
+        # Nothing received yet is not a loss, and must not divide by zero.
+        (0, 0, False),
+        (0, RECEIVED_SAMPLE, False),
+        (RECEIVED_SAMPLE, RECEIVED_SAMPLE, False),
+        (RECEIVED_SAMPLE, BELOW_TOLERANCE_COUNTED, False),
+        (RECEIVED_SAMPLE, AT_TOLERANCE_COUNTED, False),
+        (RECEIVED_SAMPLE, AT_TOLERANCE_COUNTED - 1, True),
+        (RECEIVED_SAMPLE, ABOVE_TOLERANCE_COUNTED, True),
+        (RECEIVED_SAMPLE, 0, True),
+        # The two counters are read a moment apart, so ours can lead.
+        (RECEIVED_SAMPLE, RECEIVED_SAMPLE + 3, False),
+    ],
+)
+def test_loss_is_judged_as_a_ratio_of_what_arrived(
+    received: int, counted: int, expected: bool
+) -> None:
+    """A blip must not nag forever; a sustained loss must show."""
+    assert is_losing_packets(received, counted) is expected
+
+
+@pytest.mark.parametrize(
+    "received,counted,expected",
+    [
+        (RECEIVED_SAMPLE, ABOVE_TOLERANCE_COUNTED, 1_000),
+        (RECEIVED_SAMPLE, RECEIVED_SAMPLE, 0),
+        (RECEIVED_SAMPLE, RECEIVED_SAMPLE + 3, 0),
+    ],
+)
+def test_the_packets_lost_are_the_gap_between_the_two_counters(
+    received: int, counted: int, expected: int
+) -> None:
+    assert packets_lost(received, counted) == expected
+
+
+def test_sustained_loss_is_reported_as_its_own_state(
     on_windows: None, window: RateWindow
 ) -> None:
-    """Silent kernel drops are how a failing capture would otherwise hide."""
-    factory = FakeSnifferFactory(ReportingSniffer, drop_report=(100, 5))
-    source = build_source(window, factory)
+    """Silent kernel drops are how a failing capture would otherwise hide.
 
+    Reported inside ``ok`` the loss reaches the JSON and is shown to nobody,
+    because the page raises its banner only for a state it does not recognise.
+    """
+    factory = FakeSnifferFactory(
+        ReportingSniffer, drop_report=(RECEIVED_SAMPLE, DRIVER_DROPPED)
+    )
+    source = build_source(window, factory)
     source.start()
+    feed_packets(factory.sniffer, ABOVE_TOLERANCE_COUNTED)
+
+    status = source.status()
+
+    assert status.state == CAPTURE_STATE_DROPPING_PACKETS
+    assert "1,000 of the 10,000" in status.detail
+    assert "400" in status.detail
+    assert "undercounted" in status.detail
+
+
+def test_loss_hidden_by_the_kernel_buffer_is_reported_though_ps_drop_is_zero(
+    on_windows: None, window: RateWindow
+) -> None:
+    """The regression guard for the measured finding.
+
+    A saturated capture was observed reporting ``ps_drop`` of zero while only
+    half the received packets had reached the callback - the rest were queued
+    in Npcap's kernel buffer, which stays quiet until it fills. Judged on
+    ``ps_drop`` alone this capture reports a clean ``ok`` while undercounting
+    every device by half.
+    """
+    factory = FakeSnifferFactory(ReportingSniffer, drop_report=(RECEIVED_SAMPLE, 0))
+    source = build_source(window, factory)
+    source.start()
+    feed_packets(factory.sniffer, RECEIVED_SAMPLE // 2)
+
+    status = source.status()
+
+    assert status.state == CAPTURE_STATE_DROPPING_PACKETS
+    assert "5,000 of the 10,000" in status.detail
+
+
+def test_a_capture_losing_less_than_the_tolerance_still_reports_ok(
+    on_windows: None, window: RateWindow
+) -> None:
+    factory = FakeSnifferFactory(ReportingSniffer, drop_report=(RECEIVED_SAMPLE, 5))
+    source = build_source(window, factory)
+    source.start()
+    feed_packets(factory.sniffer, BELOW_TOLERANCE_COUNTED)
+
     status = source.status()
 
     assert status.state == CAPTURE_STATE_OK
-    assert "5 of 100" in status.detail
+    assert "undercounted" not in status.detail
 
 
-def test_a_capture_losing_nothing_says_nothing_about_drops(
+def test_a_capture_losing_nothing_reports_ok(
     on_windows: None, window: RateWindow
 ) -> None:
-    factory = FakeSnifferFactory(ReportingSniffer, drop_report=(100, 0))
+    factory = FakeSnifferFactory(ReportingSniffer, drop_report=(RECEIVED_SAMPLE, 0))
+    source = build_source(window, factory)
+    source.start()
+    feed_packets(factory.sniffer, RECEIVED_SAMPLE)
+
+    assert source.status().state == CAPTURE_STATE_OK
+
+
+def test_a_capture_that_has_received_nothing_reports_ok(
+    on_windows: None, window: RateWindow
+) -> None:
+    """An idle tether is not a lossy one, and zero received divides by zero."""
+    factory = FakeSnifferFactory(ReportingSniffer, drop_report=(0, 0))
     source = build_source(window, factory)
 
     source.start()
 
-    assert "dropped" not in source.status().detail
+    assert source.status().state == CAPTURE_STATE_OK
+
+
+def test_frames_that_could_not_be_read_still_count_as_having_arrived(
+    on_windows: None, window: RateWindow
+) -> None:
+    """They reached the callback, so they were not lost by the driver.
+
+    Counting only the packets that were successfully attributed would report a
+    capture seeing nothing but ARP as losing every packet it sees.
+    """
+    factory = FakeSnifferFactory(ReportingSniffer, drop_report=(RECEIVED_SAMPLE, 0))
+    source = build_source(window, factory)
+    source.start()
+    feed_packets(
+        factory.sniffer, RECEIVED_SAMPLE, FakePacket(ARP=FakeLayer(DEVICE_IP))
+    )
+
+    status = source.status()
+
+    assert status.state == CAPTURE_STATE_OK
+    assert f"{RECEIVED_SAMPLE} packets" in status.detail
+
+
+@pytest.mark.parametrize(
+    "preset,expected",
+    [
+        ({}, CAPTURE_STATE_CAPTURE_DIED),
+        (
+            {"start_error": RuntimeError(FAILURE_MESSAGE)},
+            CAPTURE_STATE_ERROR,
+        ),
+    ],
+)
+def test_a_capture_that_is_not_running_outranks_the_loss_it_was_showing(
+    on_windows: None, window: RateWindow, preset: dict[str, Any], expected: str
+) -> None:
+    """Rates that are not live at all are worse news than undercounted ones."""
+    factory = FakeSnifferFactory(
+        ReportingSniffer, drop_report=(RECEIVED_SAMPLE, DRIVER_DROPPED), **preset
+    )
+    source = build_source(window, factory)
+    source.start()
+    factory.sniffer.alive = False
+
+    assert source.status().state == expected
+
+
+def test_a_stopped_capture_reports_that_rather_than_the_loss(
+    on_windows: None, window: RateWindow
+) -> None:
+    factory = FakeSnifferFactory(
+        ReportingSniffer, drop_report=(RECEIVED_SAMPLE, DRIVER_DROPPED)
+    )
+    source = build_source(window, factory)
+    source.start()
+    feed_packets(factory.sniffer, ABOVE_TOLERANCE_COUNTED)
+    assert source.status().state == CAPTURE_STATE_DROPPING_PACKETS
+
+    source.stop()
+
+    assert source.status().state == CAPTURE_STATE_NOT_RUNNING
 
 
 @pytest.mark.parametrize(

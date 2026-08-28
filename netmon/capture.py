@@ -49,7 +49,14 @@ START_TIMEOUT_S = 5.0
 START_POLL_S = 0.05
 STOP_TIMEOUT_S = 2.0
 
+# Fraction of the received packets that may go uncounted before the loss is
+# worth an operator's attention. A capture that mislays a handful of packets
+# while its socket is warming up would otherwise nag for the rest of the
+# session, while a sustained loss crosses this within seconds.
+LOSS_RATIO_TOLERANCE = 0.001
+
 CAPTURE_STATE_OK = "ok"
+CAPTURE_STATE_DROPPING_PACKETS = "dropping_packets"
 CAPTURE_STATE_ERROR = "error"
 CAPTURE_STATE_NOT_RUNNING = "not_running"
 CAPTURE_STATE_CAPTURE_DIED = "capture_died"
@@ -61,9 +68,10 @@ CAPTURE_STATE_UNSUPPORTED_PLATFORM = "unsupported_platform"
 # Shown to an ROV operator verbatim in a banner, so each one names what has
 # happened and what to do about it.
 OK_DETAIL = "Capturing live traffic addressed to {host_ip}."
-DROPPED_DETAIL = (
-    "{dropped} of {received} packets were dropped by the capture driver before "
-    "they could be counted."
+DROPPING_PACKETS_DETAIL = (
+    "{lost:,} of the {received:,} packets that reached the capture driver were "
+    "lost before they could be counted, so every rate shown here is "
+    "undercounted. The driver reports {driver_dropped:,} of them discarded."
 )
 UNATTRIBUTED_DETAIL = (
     "{count} packets arrived with no address that could be counted."
@@ -225,6 +233,32 @@ def derive_state(
     return CAPTURE_STATE_OK if thread_alive else CAPTURE_STATE_CAPTURE_DIED
 
 
+def packets_lost(received: int, counted: int) -> int:
+    """How many packets the driver took in that never reached the callback.
+
+    This gap, rather than libpcap's ``ps_drop``, is the honest measure of what
+    the monitor is failing to count. A saturated capture was measured reporting
+    ``ps_drop`` of zero while only half the received packets had arrived at the
+    callback: the rest were sitting in Npcap's kernel buffer, which absorbs
+    seconds of backlog and reports nothing wrong until it finally fills. The
+    counters are also read a moment apart, so the difference is clamped rather
+    than allowed to go negative.
+    """
+    return max(received - counted, 0)
+
+
+def is_losing_packets(received: int, counted: int) -> bool:
+    """Whether uncounted packets exceed :data:`LOSS_RATIO_TOLERANCE`.
+
+    A ratio rather than any non-zero count, so a brief blip does not nag an
+    operator for the rest of the session. A capture that has received nothing
+    yet has lost nothing.
+    """
+    if received <= 0:
+        return False
+    return packets_lost(received, counted) / received > LOSS_RATIO_TOLERANCE
+
+
 def is_elevated() -> bool:
     """Whether this process holds Administrator rights.
 
@@ -265,7 +299,11 @@ class CaptureSource:
         self._sniffer: Sniffer | None = None
         self._failure: CaptureStatus | None = None
         self._started = threading.Event()
-        # Written only by the capture thread, read by the HTTP threads.
+        # Written only by the capture thread, read by the HTTP threads. Plain
+        # integers rather than anything guarded: the callback is the hottest
+        # path in the program and a lock there would cost more packets than the
+        # counters exist to notice.
+        self._counted = 0
         self._unattributed = 0
 
     @property
@@ -355,7 +393,7 @@ class CaptureSource:
             self._started.is_set(), exception, _thread_alive(sniffer)
         )
         if state == CAPTURE_STATE_OK:
-            return CaptureStatus(CAPTURE_STATE_OK, self._ok_detail(sniffer))
+            return self._healthy_status(sniffer)
         if state == CAPTURE_STATE_CAPTURE_DIED:
             return CaptureStatus(state, CAPTURE_DIED_DETAIL)
         if exception is None:
@@ -388,6 +426,7 @@ class CaptureSource:
         baseline, which is the picture that is supposed to mean "this device
         went quiet".
         """
+        self._counted += 1
         source_ip = extract_source_ip(packet)
         if source_ip is None:
             self._unattributed += 1
@@ -397,16 +436,36 @@ class CaptureSource:
         except Exception:
             self._unattributed += 1
 
-    def _ok_detail(self, sniffer: Sniffer) -> str:
-        """Sentence for a healthy capture, naming anything it is losing."""
-        parts = [OK_DETAIL.format(host_ip=self._host_ip)]
+    def _healthy_status(self, sniffer: Sniffer) -> CaptureStatus:
+        """Status for a capture whose thread is alive and unbroken.
+
+        Packet loss sits at the bottom of the precedence order, reachable only
+        from here: every state above it means the rates are not live at all,
+        which is worse news than rates that are live but undercounted. The
+        driver's counter is read before ours so that a packet arriving between
+        the two reads cannot manufacture a loss that never happened.
+
+        All of the arithmetic lives here rather than in the callback, because
+        this runs twice a second against a callback that runs thousands of
+        times a second.
+        """
         counts = _drop_counts(sniffer)
-        if counts is not None:
-            received, dropped = counts
-            if dropped:
-                parts.append(
-                    DROPPED_DETAIL.format(dropped=dropped, received=received)
-                )
+        received, driver_dropped = counts if counts is not None else (0, 0)
+        counted = self._counted
+        if is_losing_packets(received, counted):
+            return CaptureStatus(
+                CAPTURE_STATE_DROPPING_PACKETS,
+                DROPPING_PACKETS_DETAIL.format(
+                    lost=packets_lost(received, counted),
+                    received=received,
+                    driver_dropped=driver_dropped,
+                ),
+            )
+        return CaptureStatus(CAPTURE_STATE_OK, self._ok_detail())
+
+    def _ok_detail(self) -> str:
+        """Sentence for a capture that is seeing everything it should."""
+        parts = [OK_DETAIL.format(host_ip=self._host_ip)]
         if self._unattributed:
             parts.append(UNATTRIBUTED_DETAIL.format(count=self._unattributed))
         return " ".join(parts)
