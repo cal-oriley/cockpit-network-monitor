@@ -7,6 +7,8 @@ depends on real time.
 """
 
 import json
+import subprocess
+import sys
 import threading
 import urllib.error
 import urllib.request
@@ -24,6 +26,14 @@ from urllib.parse import quote
 import pytest
 
 from netmon import server
+from netmon.capture import (
+    CAPTURE_STATE_CAPTURE_DIED,
+    CAPTURE_STATE_NOT_RUNNING,
+    CAPTURE_STATE_OK,
+    CaptureSource,
+    CaptureStatus,
+)
+from netmon.mock_source import MockSource
 from netmon.rate_window import RateWindow
 from netmon.server import (
     CAPTURE_STATE_DETAILS,
@@ -37,22 +47,39 @@ from netmon.server import (
     NO_STORE,
     RATES_PATH,
     SUBNET_PARAM,
+    UNKNOWN_CAPTURE_DETAIL,
+    CaptureStatusReader,
     RatesRequestHandler,
     build_parser,
+    build_source,
     capture_status_for,
+    capture_status_reader,
     devices_in_subnet,
     parse_subnet,
-    resolve_capture_status,
 )
 
 from .conftest import FakeClock
 
 INVENTED_STATE = "adapter_on_fire"
+IFACE = "\\Device\\NPF_{11111111-1111-1111-1111-111111111111}"
 
 BUCKET_MS = 250
 BUCKET_S = BUCKET_MS / 1000
 WINDOW_BUCKETS = 8
 PACKETS_PER_BUCKET = 3
+
+PAYLOAD_KEYS = {
+    "host_ip",
+    "subnet",
+    "capture",
+    "bucket_ms",
+    "buckets",
+    "now_ms",
+    "devices",
+}
+CAPTURE_KEYS = {"state", "detail"}
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 INDEX_PATH = "/"
 HTML_CONTENT_TYPE = "text/html"
@@ -88,6 +115,93 @@ class Response:
     body: dict[str, Any]
 
 
+class ChangingStatus:
+    """A reader whose answer differs every time it is called.
+
+    Stands in for a capture whose health changes while the server is up, which
+    a status resolved once at startup could never report.
+    """
+
+    def __init__(self, *states: str) -> None:
+        self._states = list(states)
+        self.calls = 0
+
+    def __call__(self) -> CaptureStatus:
+        state = self._states[min(self.calls, len(self._states) - 1)]
+        self.calls += 1
+        return capture_status_for(state)
+
+
+class StubHTTPServer:
+    """Stands in for ``ThreadingHTTPServer`` so ``main`` can be run in-process.
+
+    ``serve_forever`` raises the interrupt a Ctrl+C would, which is also how
+    the shutdown path gets exercised without a real socket or a real wait.
+    """
+
+    def __init__(self, address: tuple[str, int], handler: Any) -> None:
+        self.address = address
+        self.handler = handler
+        self.daemon_threads = False
+        self.closed = False
+
+    def serve_forever(self) -> None:
+        raise KeyboardInterrupt
+
+    def server_close(self) -> None:
+        self.closed = True
+
+
+class RecordingSource:
+    """Records how the server built it, and never opens a capture."""
+
+    def __init__(self, window: RateWindow, host_ip: str, iface: str | None) -> None:
+        self.window = window
+        self.host_ip = host_ip
+        self.iface = iface
+        self.state = CAPTURE_STATE_OK
+        self.started = False
+        self.stopped = False
+
+    def start(self) -> None:
+        self.started = True
+
+    def stop(self) -> None:
+        self.stopped = True
+
+    def status(self) -> CaptureStatus:
+        return capture_status_for(self.state)
+
+
+def run_main(
+    monkeypatch: pytest.MonkeyPatch, argv: list[str]
+) -> tuple[int, StubHTTPServer]:
+    """Run ``main`` against a stub server, returning its code and that stub."""
+    built: list[StubHTTPServer] = []
+
+    def build(address: tuple[str, int], handler: Any) -> StubHTTPServer:
+        stub = StubHTTPServer(address, handler)
+        built.append(stub)
+        return stub
+
+    monkeypatch.setattr(server, "ThreadingHTTPServer", build)
+    code = server.main(argv)
+    return code, built[0]
+
+
+def recording_sources(monkeypatch: pytest.MonkeyPatch) -> list[RecordingSource]:
+    """Replace the real capture source with recorders, returning the list."""
+    created: list[RecordingSource] = []
+
+    def build(window: RateWindow, host_ip: str, iface: str | None) -> RecordingSource:
+        source = RecordingSource(window, host_ip, iface)
+        created.append(source)
+        return source
+
+    monkeypatch.setattr(server, "CaptureSource", build)
+    return created
+
+
 def populated_window(clock: FakeClock) -> RateWindow:
     """A window holding one completed bucket of traffic from both subnets."""
     window = RateWindow(bucket_ms=BUCKET_MS, buckets=WINDOW_BUCKETS, clock=clock)
@@ -98,13 +212,18 @@ def populated_window(clock: FakeClock) -> RateWindow:
 
 
 @contextmanager
-def serving(window: RateWindow, default_subnet: str = DEFAULT_SUBNET) -> Iterator[str]:
+def serving(
+    window: RateWindow,
+    default_subnet: str = DEFAULT_SUBNET,
+    read_capture_status: CaptureStatusReader | None = None,
+) -> Iterator[str]:
     """Run the handler on a loopback port and yield its base URL."""
     handler = partial(
         RatesRequestHandler,
         window=window,
         host_ip=DEFAULT_HOST_IP,
-        capture=capture_status_for(CAPTURE_STATE_MOCK),
+        read_capture_status=read_capture_status
+        or partial(capture_status_for, CAPTURE_STATE_MOCK),
         default_subnet=parse_subnet(default_subnet),
     )
     httpd = ThreadingHTTPServer((LOOPBACK, EPHEMERAL_PORT), handler)
@@ -176,21 +295,43 @@ def test_unknown_states_are_accepted_and_described() -> None:
     assert INVENTED_STATE in status.detail
 
 
-def test_mock_traffic_is_reported_as_such() -> None:
-    assert resolve_capture_status(mock=True, forced=None).state == CAPTURE_STATE_MOCK
+@pytest.mark.parametrize(
+    "state", [CAPTURE_STATE_CAPTURE_DIED, CAPTURE_STATE_NOT_RUNNING]
+)
+def test_the_states_only_a_running_capture_produces_can_be_reviewed(
+    state: str,
+) -> None:
+    """--capture-status exists to see banners this machine cannot produce."""
+    status = capture_status_for(state)
+
+    assert status.state == state
+    assert status.detail != UNKNOWN_CAPTURE_DETAIL.format(state=state)
 
 
-def test_a_forced_state_wins_over_the_mock_flag() -> None:
-    status = resolve_capture_status(mock=True, forced=INVENTED_STATE)
+def test_without_a_forced_state_the_sources_own_reader_is_used() -> None:
+    live = ChangingStatus(CAPTURE_STATE_OK)
 
-    assert status.state == INVENTED_STATE
+    assert capture_status_reader(live, None) is live
 
 
-def test_running_without_any_source_is_reported_as_an_error() -> None:
-    status = resolve_capture_status(mock=False, forced=None)
+@pytest.mark.parametrize(
+    "forced", [INVENTED_STATE, CAPTURE_STATE_CAPTURE_DIED, CAPTURE_STATE_NOT_RUNNING]
+)
+def test_a_forced_state_overrides_whatever_the_source_reports(forced: str) -> None:
+    live = ChangingStatus(CAPTURE_STATE_OK)
 
-    assert status.state == CAPTURE_STATE_ERROR
-    assert "--mock" in status.detail
+    reader = capture_status_reader(live, forced)
+
+    assert reader().state == forced
+    assert live.calls == 0
+
+
+def test_the_mock_source_supplies_the_mock_state(clock: FakeClock) -> None:
+    window = RateWindow(bucket_ms=BUCKET_MS, buckets=WINDOW_BUCKETS, clock=clock)
+
+    reader = capture_status_reader(MockSource(window).status, None)
+
+    assert reader().state == CAPTURE_STATE_MOCK
 
 
 def test_web_directory_is_resolved_from_the_package_not_the_cwd() -> None:
@@ -261,6 +402,45 @@ def test_omitting_the_parameter_serves_the_default_subnet(clock: FakeClock) -> N
         len(device["pps"]) == response.body["buckets"]
         for device in response.body["devices"]
     )
+
+
+def test_the_payload_carries_exactly_the_documented_keys(clock: FakeClock) -> None:
+    with serving(populated_window(clock)) as base_url:
+        response = fetch_rates(base_url)
+
+    assert set(response.body) == PAYLOAD_KEYS
+    assert set(response.body["capture"]) == CAPTURE_KEYS
+
+
+def test_the_capture_status_is_read_again_for_every_poll(clock: FakeClock) -> None:
+    """The regression guard for a status frozen at startup.
+
+    A capture that dies at minute nine has to be reported at minute nine: the
+    page draws a dead capture as every device falling quiet, which is exactly
+    the picture that is supposed to mean a device went quiet.
+    """
+    live = ChangingStatus(CAPTURE_STATE_OK, CAPTURE_STATE_CAPTURE_DIED)
+
+    with serving(populated_window(clock), read_capture_status=live) as base_url:
+        first = fetch_rates(base_url)
+        second = fetch_rates(base_url)
+
+    assert first.body["capture"]["state"] == CAPTURE_STATE_OK
+    assert second.body["capture"]["state"] == CAPTURE_STATE_CAPTURE_DIED
+    assert live.calls == 2
+
+
+@pytest.mark.parametrize(
+    "state", [CAPTURE_STATE_OK, CAPTURE_STATE_CAPTURE_DIED, INVENTED_STATE]
+)
+def test_the_capture_object_is_always_emitted(clock: FakeClock, state: str) -> None:
+    """A payload with no capture object is rendered as healthy by the page."""
+    with serving(
+        populated_window(clock), read_capture_status=ChangingStatus(state)
+    ) as base_url:
+        response = fetch_rates(base_url)
+
+    assert response.body["capture"] == capture_status_for(state).as_dict()
 
 
 def test_a_requested_subnet_overrides_the_default(clock: FakeClock) -> None:
@@ -347,6 +527,7 @@ def test_cli_defaults_match_the_documented_ones() -> None:
     assert args.host == DEFAULT_BIND_HOST
     assert args.host_ip == DEFAULT_HOST_IP
     assert args.subnet == DEFAULT_SUBNET
+    assert args.iface is None
     assert args.mock is False
     assert args.capture_status is None
 
@@ -365,3 +546,121 @@ def test_an_unusable_default_subnet_fails_at_startup(
 
     assert exit_info.value.code != 0
     assert "CIDR" in capsys.readouterr().err
+
+
+def test_the_mock_flag_selects_synthetic_traffic(clock: FakeClock) -> None:
+    window = RateWindow(bucket_ms=BUCKET_MS, buckets=WINDOW_BUCKETS, clock=clock)
+
+    source = build_source(
+        window, mock=True, host_ip=DEFAULT_HOST_IP, iface=None
+    )
+
+    assert isinstance(source, MockSource)
+    assert source.status().state == CAPTURE_STATE_MOCK
+
+
+def test_without_the_mock_flag_a_real_capture_source_is_built(
+    clock: FakeClock,
+) -> None:
+    window = RateWindow(bucket_ms=BUCKET_MS, buckets=WINDOW_BUCKETS, clock=clock)
+
+    source = build_source(
+        window, mock=False, host_ip=DEFAULT_HOST_IP, iface=None
+    )
+
+    assert isinstance(source, CaptureSource)
+    assert source.status().state == CAPTURE_STATE_NOT_RUNNING
+    assert source.running is False
+
+
+def test_the_mock_path_never_reaches_scapy() -> None:
+    """``--mock`` has to keep working on a machine with no scapy installed."""
+    probe = (
+        "import sys;"
+        "from netmon.rate_window import RateWindow;"
+        "from netmon.server import build_source;"
+        "build_source(RateWindow(), mock=True,"
+        f" host_ip={DEFAULT_HOST_IP!r}, iface=None);"
+        "print(any(m == 'scapy' or m.startswith('scapy.') for m in sys.modules))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+        check=True,
+    )
+
+    assert result.stdout.strip() == "False"
+
+
+def test_the_handler_is_given_the_sources_own_live_reader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Binding the method, not its answer, is what keeps the status live."""
+    sources = recording_sources(monkeypatch)
+
+    code, stub = run_main(monkeypatch, [])
+    reader = stub.handler.keywords["read_capture_status"]
+    sources[0].state = CAPTURE_STATE_CAPTURE_DIED
+
+    assert code == 0
+    assert reader().state == CAPTURE_STATE_CAPTURE_DIED
+
+
+@pytest.mark.parametrize("argv,expected", [([], None), (["--iface", IFACE], IFACE)])
+def test_the_interface_flag_reaches_the_capture_source(
+    monkeypatch: pytest.MonkeyPatch, argv: list[str], expected: str | None
+) -> None:
+    sources = recording_sources(monkeypatch)
+
+    server_code, _ = run_main(monkeypatch, argv)
+
+    assert server_code == 0
+    assert sources[0].iface == expected
+    assert sources[0].host_ip == DEFAULT_HOST_IP
+
+
+def test_a_forced_state_still_wins_once_the_server_is_wired(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sources = recording_sources(monkeypatch)
+
+    _, stub = run_main(monkeypatch, ["--capture-status", INVENTED_STATE])
+    reader = stub.handler.keywords["read_capture_status"]
+
+    assert reader().state == INVENTED_STATE
+    assert sources[0].started is True
+
+
+def test_an_interrupted_run_shuts_the_source_down_cleanly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ctrl+C must leave neither a traceback nor a capture still running."""
+    sources = recording_sources(monkeypatch)
+
+    code, stub = run_main(monkeypatch, [])
+
+    assert code == 0
+    assert sources[0].started is True
+    assert sources[0].stopped is True
+    assert stub.closed is True
+
+
+def test_an_interrupt_while_the_capture_opens_still_stops_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Opening a capture waits on confirmation, so Ctrl+C can land there."""
+
+    def interrupted_start(self: RecordingSource) -> None:
+        self.started = True
+        raise KeyboardInterrupt
+
+    sources = recording_sources(monkeypatch)
+    monkeypatch.setattr(RecordingSource, "start", interrupted_start)
+
+    code, stub = run_main(monkeypatch, [])
+
+    assert code == 0
+    assert sources[0].stopped is True
+    assert stub.closed is True

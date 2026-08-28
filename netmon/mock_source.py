@@ -13,9 +13,13 @@ import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
+from .capture import CaptureStatus
 from .rate_window import MS_PER_SECOND, RateWindow
 
 Clock = Callable[[], float]
+
+CAPTURE_STATE_MOCK = "mock"
+MOCK_DETAIL = "Showing simulated traffic."
 
 TELEMETRY_PPS = 30.0
 TELEMETRY_JITTER = 0.08
@@ -156,6 +160,15 @@ class MockSource:
     def running(self) -> bool:
         """Whether the generator thread is currently alive."""
         return self._thread is not None and self._thread.is_alive()
+
+    def status(self) -> CaptureStatus:
+        """Say that this traffic is simulated, however the thread is faring.
+
+        Synthetic traffic has no health to report: the state names where the
+        rates came from, so the page can tag them as invented rather than
+        warning about a capture that was never meant to exist.
+        """
+        return CaptureStatus(CAPTURE_STATE_MOCK, MOCK_DETAIL)
 
     def tick(self) -> None:
         """Record one bucket's worth of traffic for every device."""

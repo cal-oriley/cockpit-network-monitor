@@ -12,8 +12,7 @@ import argparse
 import ipaddress
 import json
 import sys
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Sequence
 from functools import partial
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -21,7 +20,19 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-from .mock_source import MockSource
+from .capture import (
+    CAPTURE_STATE_CAPTURE_DIED,
+    CAPTURE_STATE_ERROR,
+    CAPTURE_STATE_INTERFACE_MISSING,
+    CAPTURE_STATE_NEEDS_ELEVATION,
+    CAPTURE_STATE_NOT_RUNNING,
+    CAPTURE_STATE_NPCAP_MISSING,
+    CAPTURE_STATE_OK,
+    CAPTURE_STATE_UNSUPPORTED_PLATFORM,
+    CaptureSource,
+    CaptureStatus,
+)
+from .mock_source import CAPTURE_STATE_MOCK, MOCK_DETAIL, MockSource
 from .rate_window import RateWindow
 
 DEFAULT_PORT = 8080
@@ -38,50 +49,49 @@ SUBNET_ADVICE = f"Enter a subnet in CIDR form, such as {DEFAULT_SUBNET}."
 
 IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
 
+# Both sources satisfy this, which is what lets the handler ask for the current
+# capture health while it builds each response instead of being handed a value
+# that was true only at startup.
+CaptureStatusReader = Callable[[], CaptureStatus]
+PacketSource = CaptureSource | MockSource
+
 # Resolved from the package location so the server works from any working
 # directory - it is routinely launched from somewhere other than the repo root.
 WEB_DIRECTORY = Path(__file__).resolve().parent.parent / "web"
 
-CAPTURE_STATE_OK = "ok"
-CAPTURE_STATE_MOCK = "mock"
-CAPTURE_STATE_ERROR = "error"
-
+# Sentences for a state named on the command line, where none of the context a
+# real capture reports - the address, the platform, the driver's own message -
+# is available. The live sources word their own details from what they observed.
 CAPTURE_STATE_DETAILS: dict[str, str] = {
     CAPTURE_STATE_OK: "Capturing live traffic.",
-    CAPTURE_STATE_MOCK: "Showing simulated traffic.",
-    "needs_elevation": (
+    CAPTURE_STATE_MOCK: MOCK_DETAIL,
+    CAPTURE_STATE_NEEDS_ELEVATION: (
         "Packet capture needs Administrator rights; restart this program as an "
         "administrator."
     ),
-    "npcap_missing": (
+    CAPTURE_STATE_NPCAP_MISSING: (
         "Npcap is not installed. Install it from npcap.com, then restart this "
         "program to capture live traffic."
     ),
-    "interface_missing": (
+    CAPTURE_STATE_INTERFACE_MISSING: (
         "No network interface for the vehicle subnet was found; check that the "
         "tether is connected and the adapter still holds its static address."
     ),
-    "unsupported_platform": (
+    CAPTURE_STATE_UNSUPPORTED_PLATFORM: (
         "Packet capture is only available on Windows in this release."
     ),
-    CAPTURE_STATE_ERROR: "Packet capture stopped unexpectedly.",
+    CAPTURE_STATE_NOT_RUNNING: (
+        "Packet capture is not running; restart this program to see live "
+        "traffic."
+    ),
+    CAPTURE_STATE_CAPTURE_DIED: (
+        "Packet capture stopped unexpectedly after starting, so these rates "
+        "are no longer live; restart this program."
+    ),
+    CAPTURE_STATE_ERROR: "Packet capture failed.",
 }
 
 UNKNOWN_CAPTURE_DETAIL = "Packet capture reported an unrecognised state: {state}."
-NO_SOURCE_DETAIL = (
-    "No packet source is running; restart with --mock to see simulated traffic."
-)
-
-
-@dataclass(frozen=True)
-class CaptureStatus:
-    """What the UI is told about the health of the packet source."""
-
-    state: str
-    detail: str
-
-    def as_dict(self) -> dict[str, str]:
-        return {"state": self.state, "detail": self.detail}
 
 
 def capture_status_for(state: str) -> CaptureStatus:
@@ -97,17 +107,33 @@ def capture_status_for(state: str) -> CaptureStatus:
     return CaptureStatus(state=state, detail=detail)
 
 
-def resolve_capture_status(mock: bool, forced: str | None) -> CaptureStatus:
-    """Decide the reported capture status from the CLI flags.
+def capture_status_reader(
+    live: CaptureStatusReader, forced: str | None
+) -> CaptureStatusReader:
+    """Choose what the handler asks for the capture status.
 
-    An explicit ``--capture-status`` always wins, since its whole purpose is
-    reviewing a state the machine at hand cannot actually produce.
+    Normally that is the source's own live reader, so a capture that dies at
+    minute nine is reported at minute nine. An explicit ``--capture-status``
+    wins, since its whole purpose is reviewing a state the machine at hand
+    cannot actually produce; it is supplied as a constant reader so both paths
+    go through the same mechanism.
     """
-    if forced is not None:
-        return capture_status_for(forced)
+    if forced is None:
+        return live
+    return partial(capture_status_for, forced)
+
+
+def build_source(
+    window: RateWindow, mock: bool, host_ip: str, iface: str | None
+) -> PacketSource:
+    """The packet source the flags ask for.
+
+    A :class:`CaptureSource` is constructed only when one is actually wanted,
+    so ``--mock`` still runs on a machine with no scapy installed.
+    """
     if mock:
-        return capture_status_for(CAPTURE_STATE_MOCK)
-    return CaptureStatus(state=CAPTURE_STATE_ERROR, detail=NO_SOURCE_DETAIL)
+        return MockSource(window)
+    return CaptureSource(window, host_ip, iface)
 
 
 def parse_subnet(value: str) -> IPNetwork:
@@ -153,13 +179,13 @@ class RatesRequestHandler(SimpleHTTPRequestHandler):
         *args: Any,
         window: RateWindow,
         host_ip: str,
-        capture: CaptureStatus,
+        read_capture_status: CaptureStatusReader,
         default_subnet: IPNetwork,
         **kwargs: Any,
     ) -> None:
         self._window = window
         self._host_ip = host_ip
-        self._capture = capture
+        self._read_capture_status = read_capture_status
         self._default_subnet = default_subnet
         # The base class handles the whole request from within __init__, so
         # everything the handler needs must already be attached.
@@ -178,7 +204,11 @@ class RatesRequestHandler(SimpleHTTPRequestHandler):
         """Answer one poll, narrowed to the subnet it asked for.
 
         The requested subnet is a parameter of the read and is never retained,
-        so two pages can watch different subnets against one process.
+        so two pages can watch different subnets against one process. The
+        capture status is read here too, for the same reason in reverse: a
+        status resolved once at startup could never report a capture that died
+        afterwards, and the page renders a dead capture as every device going
+        quiet.
         """
         requested = parse_qs(
             urlsplit(self.path).query, keep_blank_values=True
@@ -199,7 +229,7 @@ class RatesRequestHandler(SimpleHTTPRequestHandler):
             {
                 "host_ip": self._host_ip,
                 "subnet": str(network),
-                "capture": self._capture.as_dict(),
+                "capture": self._read_capture_status().as_dict(),
                 **snapshot,
             },
         )
@@ -253,6 +283,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--iface",
+        default=None,
+        help=(
+            "Capture interface to listen on, overriding the adapter derived "
+            "from --host-ip (default: derived)"
+        ),
+    )
+    parser.add_argument(
         "--mock",
         action="store_true",
         help="Feed the aggregator synthetic traffic instead of real packets",
@@ -281,14 +319,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(str(error))
 
     window = RateWindow()
-    source = MockSource(window) if args.mock else None
-    capture = resolve_capture_status(mock=args.mock, forced=args.capture_status)
+    source = build_source(
+        window, mock=args.mock, host_ip=args.host_ip, iface=args.iface
+    )
+    read_capture_status = capture_status_reader(source.status, args.capture_status)
 
     handler = partial(
         RatesRequestHandler,
         window=window,
         host_ip=args.host_ip,
-        capture=capture,
+        read_capture_status=read_capture_status,
         default_subnet=default_subnet,
     )
     try:
@@ -304,22 +344,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             "respond.",
             file=sys.stderr,
         )
-    print(
-        f"Serving on http://{args.host}:{args.port}/ "
-        f"(capture: {capture.state}, subnet: {default_subnet})",
-        flush=True,
-    )
-
-    if source is not None:
-        source.start()
     try:
+        # Started before the banner is printed so the state it names is the one
+        # the source actually reached, not the one it held before opening.
+        source.start()
+        print(
+            f"Serving on http://{args.host}:{args.port}/ "
+            f"(capture: {read_capture_status().state}, subnet: {default_subnet})",
+            flush=True,
+        )
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         server.server_close()
-        if source is not None:
-            source.stop()
+        source.stop()
     return 0
 
 

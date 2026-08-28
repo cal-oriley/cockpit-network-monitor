@@ -13,10 +13,12 @@ import time
 import pytest
 
 from netmon.mock_source import (
+    CAPTURE_STATE_MOCK,
     DEFAULT_MOCK_DEVICES,
     DROPOUT_PERIOD_S,
     DROPOUT_SILENCE_S,
     LATE_APPEARANCE_S,
+    MOCK_DETAIL,
     THREAD_NAME,
     MockDevice,
     MockSource,
@@ -223,6 +225,29 @@ def test_long_run_rate_tracks_the_profile(
     total = device_named(window, ip)["total_packets"]
 
     assert total == pytest.approx(expected_pps * duration_s, rel=0.15)
+
+
+def test_the_source_reports_that_its_traffic_is_simulated(clock: FakeClock) -> None:
+    _, source = build_source(clock)
+
+    status = source.status()
+
+    assert status.state == CAPTURE_STATE_MOCK
+    assert status.detail == MOCK_DETAIL
+    assert status.as_dict() == {"state": CAPTURE_STATE_MOCK, "detail": MOCK_DETAIL}
+
+
+def test_the_mock_state_does_not_depend_on_the_thread(clock: FakeClock) -> None:
+    """Simulated traffic has no health, so its state never becomes a warning."""
+    _, source = build_source(clock, devices=())
+
+    before = source.status()
+    source.start()
+    running = source.status()
+    source.stop()
+
+    assert before == running == source.status()
+    assert source.status().state == CAPTURE_STATE_MOCK
 
 
 def test_tick_ms_must_be_positive(clock: FakeClock) -> None:
