@@ -1,0 +1,75 @@
+---
+description: End substantive work with a short findings and changes summary
+alwaysApply: true
+---
+
+# Session Wrap-Up Summary
+
+When you finish a task the user asked for (or you stop because you are blocked), end your **final** reply with a brief wrap-up. Skip this section for trivial exchanges: one-line answers, pure clarification, or questions you did not investigate or change.
+
+## When to include
+
+Include the wrap-up after:
+
+- Implementing or fixing code, config, CI, or docs
+- Debugging or root-cause analysis (even if no code changed)
+- Multi-step exploration with a concrete recommendation
+- Partial completion or an explicit blocker
+
+Do **not** add a wrap-up for: greetings, definitions, or answers that required no tools and no repo changes. Replies that only answer or explain something close with an answer summary instead — see `human-interface/answer-summary.mdc`, which owns that side of the boundary.
+
+## Format
+
+Use these headings only when they have content. Keep the whole wrap-up short (roughly 3–8 bullets total); prefer plain language over identifiers.
+
+### Outcome
+
+One sentence: what the user has now (e.g. fixed, added, documented, still blocked and why).
+
+When the work reached a **pull request** — you opened one, or pushed commits to the open one — include a **clickable markdown link** to it here (e.g. `[PR #21](https://github.com/owner/repo/pull/21)`). Do the same for any issue or release the work created. The developer should be able to click straight through from the wrap-up, never hunt for the URL or run `gh` to find it.
+
+### Findings
+
+What you learned that matters to the user:
+
+- Root cause or likely cause
+- Constraints, edge cases, or risks discovered
+- Decisions made and why (if not obvious from the change)
+
+Omit file paths unless they help the user act (e.g. where to edit next).
+
+### Changes
+
+Bullet list of **user-visible or behavioral** changes, not a raw file dump:
+
+- What changed and why (feature, fix, config, README, etc.)
+- Note intentional **non**-changes when the user might expect something (e.g. "README unchanged; internal refactor only")
+
+If you edited the repo, align with `CHANGELOG.txt` bullets when that rule applies; the wrap-up is for the user in chat, not a substitute for the changelog file.
+
+### Deviations from plan
+
+When the work followed a plan or spec, list any deviations from it and why each was justified, so they are visible rather than buried. The organizer reports **every** deviation to the user here — including ones it already detected and resolved mid-run; being handled does **not** exempt a plan change from being reported (see `roles/organizer.mdc`). If there were none, say so in one line. Always include this section for plan-driven work — see `planning/plans.mdc` (Deviations from the Plan).
+
+### Follow-ups
+
+Only when useful: blocked items, manual steps (build, deploy, test), or optional next work. Do not pad with generic offers to help. Surface any required **in-real-life / hardware testing steps** here for the developer to run — never claim them passed (see `testing/irl-testing.mdc`).
+
+## Quality bar
+
+- Be accurate: do not claim tests ran or builds passed unless you ran them.
+- If blocked, state what you tried, what failed, and the best next step.
+
+## Example
+
+**Outcome:** The API no longer 500s when the external service is unconfigured — [PR #21](https://github.com/owner/repo/pull/21) is up for review.
+
+**Findings:** The handler assumed env vars were always set; empty strings were treated as valid and failed at connect time.
+
+**Changes:**
+- Return a clear 503 with a message when the external service is not configured
+- Document the env vars in README Run section
+
+**Deviations from plan:** None.
+
+**Follow-ups:** Redeploy the backend image for the fix to apply on the target device/server.

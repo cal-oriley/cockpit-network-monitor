@@ -1,0 +1,177 @@
+---
+description: Pull request behaviour — linking issues, titles/labels, test plans, and managing the active PR
+alwaysApply: true
+---
+
+# Pull Request Behaviour
+
+The PR — its title, linked issues, and labels — is the durable record of a
+change. Change history lives in GitHub as a single lineage:
+
+**GitHub issues → closing-keyword references in PRs → GitHub auto-generated release notes (from merged PRs).**
+
+Use the `gh` CLI for all of the below (no hardcoded repo — `gh` infers it from
+the current checkout).
+
+## Merging is the developer's decision
+
+Agents **must not merge pull requests.** Opening a PR, pushing more commits to
+the feature branch, and updating the PR body are all fair game — but the
+**merge itself is the developer's call**, made by a human after review. (This
+may be revisited later; for now, state it plainly.)
+
+### Always do
+
+- Leave a PR **open** for the developer to review and merge once your work is
+  pushed and the PR is up to date.
+- Report that the PR is ready and hand the merge decision to the developer,
+  linking the PR in the wrap-up so they can click straight through (see
+  `human-interface/session-wrap-up-summary.mdc`).
+- Ask the developer to **let you know once it's merged**, so you can run the
+  after-merge cleanup — see `git/git-branch-and-pr-workflow.mdc` ("After the
+  developer merges the PR").
+
+### Never do
+
+- Run `gh pr merge` (or merge via the web UI, git, or any automation).
+- Enable auto-merge, or otherwise cause the PR to merge without the developer
+  explicitly deciding to.
+
+## Creating issues
+
+Don't **manufacture** a GitHub issue for routine work just to track it and
+immediately close it. Adding a feature or making a change does **not** require
+an issue — issue creation is optional (see `process.mdc`, where "GitHub issue
+creation" is an optional intake step).
+
+### Always do
+
+- Track **genuine, pre-existing or standalone** work as an issue when it's
+  worth tracking on its own.
+- When an issue already exists, **reference and address it in the PR** and close
+  it via the PR (see "Linking issues" below).
+
+### Never do
+
+- Create a throwaway issue for a change you're about to make in the same PR just
+  to have something to close.
+
+## Linking issues
+
+Every PR that resolves an issue MUST reference it in the **PR body** with a
+closing keyword, one issue per line:
+
+```
+Closes #12
+Fixes #34
+Resolves #56
+```
+
+- GitHub also accepts `Close`, `Fix`, and `Resolve`. Merging the PR then closes
+  the linked issue automatically.
+- Include a closing keyword for **each** issue the PR completes. A bare `#N`
+  mention, `(#N)`, or prose does **not** auto-close — the keyword is required.
+- Use `Refs #N` for issues that are related but should stay **open** after
+  merge (context only, or a subset of acceptance criteria). Do not give such
+  issues a closing keyword.
+- Whenever a PR uses closing keywords, you MUST confirm GitHub actually
+  registered the links after opening or editing the body:
+
+```bash
+gh pr view <number> --json closingIssuesReferences
+```
+
+  An empty array means **no** closing links were registered — a mistyped or
+  misplaced `Closes` silently closes nothing. Fix the body and re-check until
+  every issue you intend to close appears.
+
+## Titles, labels & release-note lineage
+
+- Write PR titles that are **clear, user-facing, and release-note-worthy** —
+  merged PRs are exactly what GitHub's auto-generated release notes are built
+  from, so the title is what users will read.
+- If the repo uses labeled/categorized release-note generation (e.g.
+  release-drafter or GitHub's category labels), apply the appropriate label to
+  each PR so it lands in the right release-notes section.
+
+## Test plan
+
+Every PR you create or update MUST include a **Test plan** section in the PR
+body written as **GitHub task-list checkboxes** (`- [ ]`) that enumerate the
+manual verification steps a reviewer can follow. Never ship a PR with a
+missing, empty, or throwaway ("it compiles", "n/a") test plan.
+
+```
+## Test plan
+
+- [ ] Build / typecheck passes
+- [ ] Automated tests pass
+- [ ] <concrete manual step a reviewer can reproduce>
+- [ ] <edge case or regression exercised by this change>
+```
+
+- Write **concrete, checkable, reproducible** items tied to the actual change —
+  the exact steps to run and what a reviewer should observe — not vague filler.
+- Cover automated checks **and** the manual verification a reviewer should run.
+- Check items off (`- [x]`) as you verify them.
+- When new commits change what needs testing, refresh these checkboxes as part
+  of the push — see "Keep the PR in sync with the branch's commits" below.
+
+Keep the checkbox Test plan above the `Closes #N` lines at the bottom of the
+body.
+
+## Managing the active PR
+
+When the user asks you to "add" something to a PR (a feature, fix, change,
+etc.), they mean the **currently active pull request** — the open PR for the
+branch you are working on. Add the work to that PR; do **not** open a new one.
+
+### Always do
+
+- Identify the active PR before starting: `gh pr view` (current branch's PR) or
+  `gh pr status`.
+- Commit the new work to the **same branch** that PR tracks, then push so the
+  existing PR updates:
+
+```bash
+git push   # pushes to the branch the active PR already tracks
+```
+
+- If you are on `main`/`master` or a branch with no open PR, ask the user which
+  PR they mean instead of guessing or creating a new one.
+
+### Never do
+
+- Create a new branch + new PR for work the user asked to "add to the PR".
+- Open a second PR that duplicates or splits off the active PR's work without
+  being asked.
+
+### Exception
+
+Only open a new PR when the user **explicitly** asks for one (e.g. "open a
+separate PR for this").
+
+## Keep the PR in sync with the branch's commits
+
+The PR body is the durable, human-readable **summary over the branch's
+commits** (see `git/commit-scratchpad.mdc`, "How CHANGELOG content reaches the
+PR"). As commits accumulate on the branch, that summary goes stale unless you
+refresh it — a body describing only the first commit misrepresents what will
+merge and pollutes the release notes built from it.
+
+### Always do
+
+- Whenever you push new commits to an open PR, refresh the PR **body** in the
+  **same push** — update the Summary and the Test plan (see "Test plan") so they
+  reflect **all** commits now on the branch, not just the initial batch.
+- Add Test-plan items for the new work and check off items as you verify them.
+- Add `Closes #N` lines for any issues the new commits newly resolve, and
+  re-check the registered closing links (see "Linking issues").
+- Update the **title/labels** when the scope shifts, keeping the title
+  release-note-worthy (see "Titles, labels & release-note lineage").
+
+### Never do
+
+- Push more commits while leaving the body describing only the first commit.
+- Defer the body refresh to "later" — it is part of the same push that adds the
+  work.

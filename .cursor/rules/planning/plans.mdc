@@ -1,0 +1,265 @@
+---
+description: Plan file structure and agent coordination
+globs:
+  - .cursor/plans/**/*.md
+---
+
+# Plan Files
+
+## Location & Naming
+
+Locations & path rules: see `core.mdc` ("Plans Location").
+
+### Other Rules
+- Multi-agent work: **ONE plan file** (`{feature}-agents.plan.md`), not separate files per agent
+
+---
+
+## Multi-Agent Plan Structure
+
+All agents for a feature belong in a single plan file. This keeps coordination, boundaries, and handoffs visible in one place.
+
+```markdown
+# {Feature} Multi-Agent Plan
+
+## Summary
+What this plan does, in concrete terms (see [Plan Summary](#plan-summary)).
+
+## Agent Overview
+| Agent | Responsibility | Owns | Dependencies |
+|-------|---------------|------|--------------|
+| Agent 1 | Backend/service logic | {module}/services/… | None |
+| Agent 2 | UI components | {ui}/components/… | None |
+| Agent 3 | Wiring + shared state | {shared}/…, {state}/… | Agent 1 |
+
+## Shared Files
+| File | Owner | Rule |
+|------|-------|------|
+| {shared interface file} | Agent 3 | Others append their entries |
+| {shared registry file} | Agent 3 | Others request additions |
+
+---
+
+## Agent 1: {Name}
+
+### Prompt
+> {Copy-paste ready prompt — see template below}
+
+### Boundary
+- **OWNS (exclusive write):** `{module}/services/…`
+- **READS (no modify):** `{shared types file}`, `{shared registry file}`
+
+### Tasks
+- [ ] Task 1
+- [ ] Task 2
+
+### Deliverables
+What this agent produces for others to consume.
+
+---
+
+## Agent 2: {Name}
+... (same structure for each agent)
+```
+
+---
+
+## Plan Summary
+
+Every plan opens with a **Summary**, before the agent breakdown. Its job is
+to **conceptualize the work in concrete terms** — what actually exists or
+behaves differently once the plan is done — so a reader understands the
+change itself, not just the tasks that produce it.
+
+Write it for the change at hand:
+
+- **New app or feature** — what it is, what it does, and who uses it.
+- **Change to existing behavior** — how the system behaves today and how it
+  behaves afterwards.
+- **Refactor or infrastructure work** — what ends up structurally different
+  and what stays the same for users.
+
+A few sentences is enough. Don't restate the plan's title, and don't list
+the tasks or agents — those follow below it in the plan.
+
+### Keep it current
+
+The Summary describes the plan as it stands, so it goes stale the moment
+the plan changes. The **organizer** — single writer of the plan (see
+`roles/organizer.mdc`) — updates the Summary in the **same edit** that
+changes the plan, including when a
+[deviation](#deviations-from-the-plan) is folded back in. A Summary that
+no longer matches the rest of the plan is a defect in the plan.
+
+---
+
+## Agent Boundaries
+
+Clear boundaries prevent agents from stepping on each other's work.
+
+### Ownership Rules
+
+1. **Exclusive ownership** — Each agent OWNS specific files/directories and has sole write access
+2. **Read-only access** — Agents can read other agents' files but must not modify them
+3. **Shared files** — Designate one owner; others either append to designated sections or request the owner to make changes
+
+### Handling Conflicts
+
+If an agent MUST touch another agent's file:
+
+- Document why in the plan before starting
+- Coordinate timing — wait until the owner completes their work
+- Limit changes to specific lines or functions, not broad edits
+
+### Interface Contracts (required for parallel execution)
+
+Any multi-agent plan intended for **parallel execution** must define the
+**interface contracts between modules** — not just file ownership. For
+each boundary between agents, specify the concrete:
+
+- **API surface** each agent exposes for others to call
+- **Function/method signatures** at that boundary
+- **Shared types / data shapes** exchanged between agents
+
+Agents code against these agreed signatures instead of waiting to see a
+peer's implementation, which is what lets them work in parallel without
+stepping on each other. See `development/parallel-subagents.mdc` for execution.
+
+### Deviations from the Plan
+
+Legitimate deviations from an agreed plan are **allowed** — but they must
+be **explicit and justified**, never silent divergence or scope creep.
+
+- Every deviation is floated up to the final work summary for the
+  **user** (see `human-interface/session-wrap-up-summary.mdc`). Resolution by the
+  organizer does **not** exempt it: the user is told about every plan
+  change, even ones the organizer already detected and handled mid-run.
+- Deviations that affect a **subsystem or interface boundary** (a contract
+  between agents) are escalated, not patched around peer-to-peer: the doer
+  escalates and the organizer — single writer of the plan — re-plans and
+  re-runs the affected agents. See `roles/doer.mdc` and `roles/organizer.mdc`.
+- Mid-run interface-contract changes are rare and expensive. Once
+  identified, re-plan / re-run rather than patching around them.
+
+---
+
+## Code Quality Expectations
+
+All agent prompts should emphasize **high code quality and organization**:
+
+- Clean, readable, well-documented code
+- Proper error handling and edge cases
+- Consistent naming conventions and file organization
+- Follow existing patterns in the codebase
+
+Language- and style-specific rules (naming, typing, imports, formatting)
+live in `development/style.mdc`; "no shortcuts / tech debt" lives in
+`development/no-hacky-features.mdc` — point agents at those rather than
+restating them here.
+
+Include this expectation in every agent prompt.
+
+---
+
+## Agent Prompt Template
+
+Each agent's prompt must be **copy-paste ready** with clear scope, boundaries, and deliverables:
+
+Concrete paths and commands come from the project's own structure and its
+`AGENTS.md`; the placeholders below stand in for them.
+
+```markdown
+### Prompt
+> Implement {feature} with high code quality.
+>
+> **Scope:**
+> - Create the service/logic in `{owned module path}/`
+> - Register any shared entries in `{shared registry file}` and wire handlers
+> - Add types in `{shared types file}` (or the domain's types location)
+> - Create UI components in `{owned ui path}/`
+> - Add shared state in `{state path}/` if needed
+> - Follow existing patterns and conventions
+>
+> **Boundaries:**
+> - OWNS: `{owned module path}/…`, `{owned ui path}/…`
+> - READS: `{shared types file}`, `{shared registry file}`
+> - Do NOT modify: other agents' owned directories
+>
+> **Quality Requirements:**
+> - High code quality and organization (see `development/style.mdc`)
+> - No shortcuts or tech debt (see `development/no-hacky-features.mdc`)
+> - Error handling and edge cases covered
+> - Clean, readable, documented code
+>
+> **Deliverables:**
+> - Working feature integrated with the rest of the system
+> - A concise inline summary of what changed, for independent review (see `development/independent-review.mdc`)
+>
+> **When complete:** Run the project's lint/typecheck/build commands (see the project's `AGENTS.md`) and report results.
+```
+
+---
+
+## Completion Summary
+
+The **doer** ends with a concise **inline** summary of what it changed —
+this is the input an independent reviewer audits, not a trusted record.
+Keep it in the work summary (chat / PR), not a persisted file (doer
+behavior: see `roles/doer.mdc`).
+
+- **What changed** — files touched and why
+- **Verification** — the tests, lint, typecheck, and build the agent ran
+- **Deviations from plan** — any divergence and its justification (see
+  [Deviations from the Plan](#deviations-from-the-plan))
+- **Handoff notes** — what the next agent or the coordinator needs to know
+
+Completed non-trivial work is then verified by a fresh reviewer instance
+per `development/independent-review.mdc`.
+
+---
+
+## Plan Approval
+
+Writing the plan and implementing it are **separate steps, separated by the
+developer**. Planning ends at the **Plan ready?** gate — the developer's
+call, not the organizer's (see `process.mdc`).
+
+When the plan file is written or rewritten, **stop**:
+
+- Tell the developer where the plan lives and give a short overview of what
+  it will do (the plan's [Summary](#plan-summary) is that overview).
+- **Wait for an explicit go-ahead** before implementing any of it. Silence,
+  a clarifying answer, or a "looks good" on some unrelated point is not
+  approval.
+- Do **not** write the plan and start executing it in the same turn.
+
+Being **asked for a plan is not approval to build it.** Only an explicit
+instruction to implement, build, or execute opens the Development phase. If
+it's genuinely ambiguous whether the developer is approving or still
+discussing, **ask** — the cost of one question is far below that of an
+unwanted implementation run.
+
+Developer feedback at this gate loops back into the plan: the organizer —
+single writer of the plan — revises it, updates the Summary to match, and
+**returns to this same gate**. Each rewrite needs its own go-ahead.
+
+---
+
+## Execution
+
+Once the developer has approved the plan (see
+[Plan Approval](#plan-approval)) and asks for it to be implemented, the
+**organizer** executes it per `development/parallel-subagents.mdc` and
+`roles/organizer.mdc`:
+
+- Confirm parallel (or sequential) subagent strategy **before** launching subagents
+- Match the plan's Agent Overview, phases, and dependency footnotes
+
+---
+
+## Cleanup
+
+When a plan is fully complete and verified:
+
+- Prepend `COMPLETE-` to the filename, or
+- Move to `.cursor/plans/completed/` subfolder

@@ -1,0 +1,54 @@
+---
+description: Keep README.md in sync with code changes; keep it a brief overview + quickstart that links to deeper docs
+alwaysApply: true
+---
+
+# Keep the README in sync with code changes
+
+`README.md` is the front door and user-facing source of truth for the
+project. When the code changes, the README often drifts out of date
+silently and users hit the gap.
+
+## Rule
+
+After making **any** code change, before ending your turn:
+
+1. **Check the README.** Decide whether the change affects how a user
+   **runs, installs, configures, or interacts with** the project:
+   - Commands, subcommands, flags, or arguments
+   - Setup steps, requirements, dependencies, or supported platforms
+   - Defaults, env vars, ports, or paths
+   - Primary user flows or high-level architecture
+2. **Update it if needed**, following the constraints below.
+3. **If no update is needed**, note that in your turn summary
+   (e.g. "README checked, no changes required") so it's clear the step
+   wasn't skipped.
+
+## Keep the README brief
+
+The README should be a **brief overview + quickstart** with pointers to
+further documentation — not an exhaustive operating manual.
+
+- Lead with what the project is and a minimal quickstart (install, run).
+- Keep deep/reference material (full API reference, protocol internals,
+  detailed configuration matrices, troubleshooting catalogs) in dedicated
+  docs, and **link to them** rather than inlining everything.
+- Prefer a **one-line edit** in an existing section over adding a new
+  sprawling section.
+
+## How to update
+
+- **Be concise.** Match the README's existing terse, factual tone.
+- **Preserve layout.** Keep existing headings, tables, code-block
+  structure, and section order. Don't reflow or "tidy" unrelated sections.
+- **No churn.** One concern per edit; don't bury the real change in noise.
+- **Examples must still run.** If you change a command or flag used in the
+  quickstart, update the example too.
+
+## Skip README updates for
+
+- Pure internal refactors with no user-visible or architectural difference
+- Test-only changes
+- Comments, doc-strings, or typo fixes that don't change observable behavior
+
+When in doubt, check anyway — it's cheap.

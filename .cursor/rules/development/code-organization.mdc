@@ -1,0 +1,34 @@
+---
+description: Where new code, features, and functionality should live — extend existing structure by default, split out when it genuinely fits better.
+alwaysApply: true
+---
+
+# Code Organization
+
+When adding something new — a feature, function, module, type, or
+whatever — **first look for an existing, sensible place to slot it in**
+(an existing file, module, or section). Prefer **extending existing
+structure** over proliferating new files.
+
+## But don't be dogmatic
+
+This is a **judgment call**, not a hard rule:
+
+- If the new thing fits naturally **within an existing file**, put it
+  there.
+- If it genuinely makes more sense as **its own file/module**, split it
+  out — don't cram unrelated things together just to avoid a new file.
+
+## The goal
+
+Coherent, non-redundant organization: **neither cramming unrelated
+things together nor scattering closely-related things across many
+files.**
+
+## Related
+
+- Where **ruleset rules** go (domain folders) is covered by
+  `meta.mdc` ("Domain organization") — this rule is the general
+  principle for code and functionality.
+- File-size thresholds that push a file toward splitting live in
+  `development/style.mdc` ("File Size").

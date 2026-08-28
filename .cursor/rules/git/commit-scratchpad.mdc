@@ -1,0 +1,66 @@
+---
+description: Local CHANGELOG.txt scratchpad for drafting commit messages
+alwaysApply: true
+---
+
+# CHANGELOG.txt commit scratchpad
+
+`CHANGELOG.txt` is a **local drafting aid** at the repo root that accumulates notes for the branch's **as-yet-unpushed** work. Append short notes as you work, summarize them into each commit's message when you commit, and clear the file **once** at the end of the Git-stage push (see "Ownership" and "Clearing" below) — never per commit.
+
+## Ownership (who clears it)
+
+The **coordinator** owns the `CHANGELOG.txt` lifecycle: the **organizer** in the plan-based pathway, the **lone agent** in the one-shot pathway (see `definitions.mdc`).
+
+- **Doers / subagents MAY append** bullets for the work they did, but MUST **never clear** the scratchpad (pointer: see `roles/doer.mdc`).
+- **The coordinator clears it exactly once**, at the **end of the Git-stage push step**, after the branch's commits have been pushed (see `roles/organizer.mdc`, `roles/lone-agent.mdc`).
+- **Never clear per commit.** Per-commit clearing would clobber bullets that other still-running subagents appended for their own not-yet-made commits.
+
+## Keep it out of version control
+
+`CHANGELOG.txt` must **never** be staged, committed, or pushed. Add a `CHANGELOG.txt` entry to the host project's `.gitignore` (create the entry if it's missing) so the scratchpad stays local. Never stage or commit `CHANGELOG.txt`.
+
+## How CHANGELOG content reaches the PR
+
+The scratchpad is **not** pushed as a file and does **not** seed the PR body verbatim — but its content **does** reach the PR transitively:
+
+**CHANGELOG bullets → each commit's message → the PR's commit list (aggregate).** The PR body is then authored per `git/pull-request.mdc` as a summary over exactly those commits, and GitHub's release notes come from merged-PR titles.
+
+So the PR is effectively a summary of the per-commit CHANGELOG content — the scratchpad is connected to the PR, just through the commit messages rather than as a pushed file.
+
+## While working
+
+After you finish a meaningful unit of work (feature, fix, refactor, config change, docs update, etc.), append to `CHANGELOG.txt`:
+
+- Create the file if missing.
+- Add one short bullet per **area** of work: what changed and why, not file paths only.
+- Use plain bullets (`- `), one line each. No dates required.
+- **Combine edits in the same area**: edit the existing bullet instead of appending another.
+- Do **not** duplicate bullets for the same change or area.
+- Skip trivial edits unless the user asked for them.
+
+Example:
+
+```
+- Add retry with backoff so flaky uploads finish
+- Fix list endpoint 500 when the external service is unconfigured
+```
+
+## Committing (per commit — does NOT clear)
+
+Each commit summarizes the scratchpad into its **own** message but leaves the file intact:
+
+1. Read `CHANGELOG.txt` if it exists.
+2. **Commit message**: summarize the relevant bullets into 1–2 complete sentences focused on **why**. If the file is empty or missing, derive the message from `git diff` as usual.
+3. Follow the project's git safety protocol: `git status`, `git diff`, stage relevant files, commit with the summarized message. Do not stage `CHANGELOG.txt`.
+4. **Do not clear on commit.** A single commit — including doer commits and any auto-commits — never clears the scratchpad; clearing is the coordinator's end-of-push action (see below). Other subagents' bullets, and bullets for later commits on this branch, must survive.
+
+## Clearing (once, at the end of the push)
+
+Clearing is bound to **"the branch's work is committed AND pushed"**, not to a user request and not to any single commit:
+
+- After the coordinator pushes the branch's commits at the Git-stage push step, it clears `CHANGELOG.txt` (empties it) **once**. Leave the file in place for the next session.
+- **If the push fails**, do **not** clear — the scratchpad still describes the unpushed work. Fix the issue and retry.
+
+## If a commit fails
+
+Do **not** clear `CHANGELOG.txt`. Fix the issue and retry; the scratchpad still describes the pending work.

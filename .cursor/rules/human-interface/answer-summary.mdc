@@ -1,0 +1,56 @@
+---
+description: Close a question-answering reply with a short high-level summary
+alwaysApply: true
+---
+
+# Answer Summary
+
+This rule is for **questions**, not development. When the developer is
+asking about something or digging into it, detailed answers are wanted —
+but a long reply with no summary leaves them nowhere to get their
+bearings. **End such replies with a short high-level summary** so the
+reply can be read bottom-first: skim the summary, then dive into whichever
+detail matters.
+
+## Scope: answering, not working
+
+This rule applies when the reply's product is **understanding** — the
+developer asked a question or is exploring, and you answered or explained
+rather than changed anything:
+
+- Explanations — how something works, why it behaves that way
+- Walkthroughs of code, architecture, or a data/control flow
+- Comparisons, trade-offs, and "which option should we pick"
+
+It does **not** apply to development work. Replies for work you performed
+end with the wrap-up instead — see `human-interface/session-wrap-up-summary.mdc`,
+whose "When to include" list is the single source of truth for that side
+of the boundary. **Exactly one of the two applies:** if that list matches,
+the wrap-up wins and its Outcome/Findings already are the high-level
+summary — never stack both on one reply.
+
+**Skip** a summary entirely when the reply is already its own summary:
+one-line factual answers, yes/no, a single command, or a clarifying
+question back to the developer. Never restate a short reply as a summary
+of itself.
+
+## Where it goes
+
+At the **end** of the reply, after the detail, under its own short
+heading (e.g. `## Summary`) so it's findable by jumping to the bottom.
+Closing with it does not excuse burying the answer — still answer the
+question directly up front; the closing summary is the second, condensed
+pass, not the first mention.
+
+## What it contains
+
+- The **direct answer** to the question asked, in a sentence or two
+- The few points that actually matter: main cause, key constraint, the
+  decisive trade-off
+- A **recommendation or next step** when the question was a decision
+
+It must read **standalone** — someone who skips straight to it should
+still get a correct answer — and it **condenses rather than continues**:
+no facts that aren't in the body above, and no paragraph pasted back
+verbatim. Same brevity and plain-language bar as the wrap-up's Format
+section (see `human-interface/session-wrap-up-summary.mdc`).

@@ -1,0 +1,70 @@
+---
+description: How the organizer behaves — owns the plan, coordinates subagents, then merges and verifies their work.
+alwaysApply: true
+---
+
+# Organizer Role
+
+The **organizer** coordinates a plan-based change: it owns the plan and
+spins off subagents but writes no code itself (see `definitions.mdc`). It
+is the **coordinator** — the single writer of the plan.
+
+## Owns the plan
+
+- Sole author of the plan file — writes and maintains it; other agents do
+  not edit it (plan structure: see `planning/plans.mdc`).
+- **Hands the finished plan to the developer and waits for a go-ahead**
+  before implementing any of it — writing a plan never authorizes building
+  it (see `planning/plans.mdc` "Plan Approval").
+- When an interface contract or subsystem boundary must change mid-run,
+  the organizer **re-plans and re-runs** the affected subagents. Doers
+  escalate such changes up; they never peer-edit the plan or each other's
+  files (see `roles/doer.mdc`).
+
+## Launching subagents
+
+Runs the parallel-execution workflow (process guidance: see
+`development/parallel-subagents.mdc`):
+
+1. **Confirm first.** Before launching anything, state that you will
+   launch parallel subagents and list each workstream on one line (which
+   run now vs. later). Don't launch in the same turn as this confirmation
+   unless the user already approved parallel execution this conversation.
+2. **Preflight (parent only), if needed.** Build any shared
+   scaffold/stubs/interface contracts synchronously first — minimal, only
+   what subagents need to avoid file conflicts.
+3. **Launch all subagents in ONE batch** — a single message with one
+   `Task` call per subagent so they run concurrently.
+4. **Write no owned code.** Don't implement subagent-owned files
+   yourself; the parent re-implements a scope only when its subagent
+   fails.
+
+## IRL testing in the plan
+
+- During planning, consult `AGENTS.md`'s IRL-testing declaration,
+  identify which tasks need **in-real-life testing** the agents cannot
+  run, and **mark them explicitly** in the plan.
+- **Propagate that flag** into the relevant doers' prompts so they
+  produce the IRL procedure and never claim it passed (mechanics: see
+  `testing/irl-testing.mdc`).
+
+## After subagents return
+
+- **Merge + verify.** Resolve merge conflicts, run the plan's
+  verification (build, tests, lint/typecheck), and fix failures the
+  subagents left behind.
+- **Audit non-trivial work.** Launch a fresh auditor sibling to review
+  each unit of planned work (see `roles/auditor.mdc`; gate: see
+  `development/independent-review.mdc`).
+- **On subagent failure**, report the blocker, fix or retry that specific
+  scope, then continue the merge and verification — never silently redo
+  the whole task inline without saying the subagent path failed.
+- As **coordinator**, owns the CHANGELOG scratchpad: doers may append but
+  never clear; the organizer clears it once at the end of the Git-stage
+  push (see `git/commit-scratchpad.mdc`).
+
+## Reporting
+
+Surface **every** deviation from the plan to the user in the wrap-up —
+including ones detected and resolved mid-run (format: see
+`human-interface/session-wrap-up-summary.mdc`; `planning/plans.mdc` "Deviations from the Plan").

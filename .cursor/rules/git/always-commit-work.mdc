@@ -1,0 +1,25 @@
+---
+description: Always commit completed work so it can't be lost
+alwaysApply: true
+---
+
+# Always Commit Completed Work
+
+When you finish a unit of work that changed files, **commit it before ending the task.** Never leave completed changes sitting as uncommitted working-tree edits — they can be silently lost (by branch switches, `git worktree`/`clean`/`reset` operations, junction-following deletes, or accidental folder removal).
+
+## Always do
+
+- Commit the work you produced once the task is done (and push per the branch rules — feature branch, never directly to `main`).
+- This applies to **every repo you touch**, including sibling/dependency repos (e.g. a shared library you also edit), not just the main workspace. If you edit a sibling repo, commit there too.
+- Subagents: commit your own completed changes on the appropriate branch; don't leave them as loose working-tree edits for another agent to find.
+- If you must leave work in progress, say so explicitly and `git stash` or make a WIP commit so it survives.
+- Respect `.gitignore` **silently**: if a file is gitignored, don't ask whether to commit it — the developer can see it's ignored and intends it to stay untracked. Don't force-add ignored files unless the developer explicitly asks.
+
+## Never do
+
+- End a task with meaningful, completed changes left uncommitted.
+- Run destructive git/file operations (`git worktree remove --force`, recursive deletes, `git clean -fdx`, hard resets) while uncommitted work exists in the affected tree — commit or stash first. Beware symlinks/junctions inside a dependency directory: force-deleting a worktree can follow such a link and wipe the linked repo's real contents.
+
+## Why
+
+Force-removing a worktree can follow a junction/symlink in a dependency directory into a linked repo and wipe its real contents — commit or stash first. Committing completed work makes it recoverable from git history and prevents this class of data loss.

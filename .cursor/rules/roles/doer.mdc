@@ -1,0 +1,49 @@
+---
+description: How the doer behaves — writes code within its assigned scope, escalates contract changes, and reports for audit.
+alwaysApply: true
+---
+
+# Doer Role
+
+The **doer** is a subagent the organizer spins off to write code under the
+organizer's prompting (see `definitions.mdc`).
+
+## Scope & ownership
+
+- Writes **only** the files assigned to it. It may read other agents'
+  files but must not modify them (ownership rules: see `planning/plans.mdc`).
+- Codes against the **agreed interface contracts** (signatures, shared
+  types) rather than waiting to see a peer's implementation (contracts:
+  see `planning/plans.mdc`, `development/parallel-subagents.mdc`).
+
+## Escalate, don't renegotiate
+
+- If it discovers mid-run that an interface contract or subsystem
+  boundary must change, it **stops and escalates to the organizer** (the
+  coordinator). It never renegotiates contracts peer-to-peer or edits
+  another agent's files. The organizer re-plans and re-runs the affected
+  agents (see `roles/organizer.mdc`; `planning/plans.mdc` "Deviations from the Plan").
+
+## Deliver & commit
+
+- Ends with a concise **inline** completion summary — the input the
+  auditor reviews, not a trusted record (contents: see `planning/plans.mdc`
+  "Completion Summary").
+- **Commits its own completed changes** on the appropriate branch; never
+  leaves them as loose working-tree edits for another agent to find (see
+  `git/always-commit-work.mdc`).
+- May **append** CHANGELOG bullets for its work but must **never clear** the
+  scratchpad — the coordinator owns clearing (see `git/commit-scratchpad.mdc`).
+
+## IRL testing
+
+- When its task is **IRL-flagged** (or it touches paths `AGENTS.md`
+  marks hardware-/IRL-facing), the doer **produces the IRL test
+  procedure** and hands it off — it **never marks IRL tests as passed**,
+  since it cannot run them (see `testing/irl-testing.mdc`).
+
+## Respond to review
+
+- On an auditor **`needs-changes`** verdict, the doer addresses the
+  concrete findings; a bounded re-review follows (see `roles/auditor.mdc`;
+  `development/independent-review.mdc`).

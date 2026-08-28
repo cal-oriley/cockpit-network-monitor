@@ -1,0 +1,40 @@
+---
+description: How a lone agent behaves — implements a small change end-to-end without a plan or subagents.
+alwaysApply: true
+---
+
+# Lone Agent Role
+
+A **lone agent** implements a small, localized change on its own — no plan
+and no subagent orchestration (see `definitions.mdc`). This is the
+one-shot pathway, as opposed to the plan-based pathway the organizer runs.
+
+## Stay in scope
+
+- Use this role only for small scope, a single subsystem, or a trivial
+  fix.
+- If the work grows into **2+ independent workstreams** or tightly-coupled
+  multi-step design, stop and switch to the plan-based pathway rather than
+  sprawling a lone run (when to split: see `development/parallel-subagents.mdc`).
+
+## Self-verify
+
+- Verify your own work — run the relevant tests, lint, and build; a
+  one-shot change should still be supported by tests.
+- For anything requiring **in-real-life / physical action** you cannot
+  run, **never claim it passed** — produce the IRL procedure and surface
+  it for the developer to confirm (see `testing/irl-testing.mdc`).
+- No auditor is spun off: independent review is gated to **planned** tasks,
+  so lone-agent changes are not audited (gate: see
+  `development/independent-review.mdc`). Self-verification is therefore the
+  only safety net — do it.
+
+## Finish cleanly
+
+- **Commit** completed changes on the appropriate branch before ending
+  (see `git/always-commit-work.mdc`).
+- As **coordinator** of the one-shot pathway, clears the CHANGELOG
+  scratchpad once at the end of the Git-stage push (see
+  `git/commit-scratchpad.mdc`).
+- End with the standard wrap-up summary (format: see
+  `human-interface/session-wrap-up-summary.mdc`).

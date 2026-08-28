@@ -1,0 +1,145 @@
+---
+description: Governs how changes are made to this ruleset itself — organization, separation of concerns, anti-redundancy, cross-reference style, and keeping process enforcement intact.
+alwaysApply: true
+---
+
+# Editing This Ruleset
+
+Rules for changing the ruleset itself. Keep it coherent and DRY.
+
+## Only edit `core/` when developing the ruleset
+
+`core/` is the shared, reusable ruleset — it governs agent behavior across
+every project that adopts it. **Do not edit anything under `core/` unless the
+task is specifically to develop or maintain the ruleset itself.** In a
+downstream project, treat `core/` as read-only: put project-specific facts and
+overrides in the project's `AGENTS.md` (see "Separation of concerns"), not by
+mutating shared rules. The rest of this file applies **only** when that
+condition is met — you are intentionally working on the ruleset.
+
+## Domain organization
+
+Rules live in **domain subfolders** under `core/`. Rules in subfolders are
+**still active**. The domain folders **mirror the development process** —
+`planning/`, `development/`, `testing/`, and `git/` map directly to the
+process phases and stages in `process.mdc` (terms defined in
+`definitions.mdc`). The current layout:
+
+- `core/` (top level) — cross-cutting rules: `core.mdc` (editing/tooling),
+  `definitions.mdc` (terminology), `process.mdc` (process map), `meta.mdc`
+  (this file).
+- `roles/` — how each agent role **behaves**: `roles/organizer.mdc`,
+  `roles/doer.mdc`, `roles/auditor.mdc`, `roles/lone-agent.mdc`.
+- `planning/` — the **Planning** phase: `planning/plans.mdc`.
+- `development/` — the **Development** phase: `development/style.mdc`,
+  `development/no-hacky-features.mdc`, `development/final-form-changes.mdc`,
+  `development/parallel-subagents.mdc`, `development/independent-review.mdc`,
+  `development/code-organization.mdc`.
+- `testing/` — the **Testing** phase: `testing/unit-testing.mdc`,
+  `testing/irl-testing.mdc`.
+- `git/` — the **Git Stage**: `git/always-commit-work.mdc`,
+  `git/git-branch-and-pr-workflow.mdc`, `git/pull-request.mdc`,
+  `git/commit-scratchpad.mdc`.
+- `human-interface/` — human-facing communication:
+  `human-interface/session-wrap-up-summary.mdc`,
+  `human-interface/answer-summary.mdc`.
+- `documentation/` — documentation rules: `documentation/readme-sync.mdc`.
+- `external-rules/` — external/third-party rules: `external-rules/ponytail.mdc`.
+
+## Slot changes into their proper place
+
+Any change to the ruleset should be slotted into its proper place in the
+**development process**, and therefore into its proper **domain folder**.
+When adding or changing a rule, first identify **which part of the process**
+it belongs to (a phase, stage, or role), then put it in the **matching
+domain**. Prefer an existing slot; create a new domain folder only when none
+fits, and split a rule out only when it genuinely makes more sense on its own
+(see `development/code-organization.mdc`).
+
+## Separation of concerns
+
+Keep these distinct — don't mix them in one place:
+
+- **What a role IS** → `definitions.mdc` (terminology).
+- **How a role BEHAVES** → `roles/*.mdc`.
+- **Project-specific FACTS** → the project's `AGENTS.md`.
+- **Generic BEHAVIOR** → rules here.
+
+## Process enforcement is load-bearing
+
+The ruleset's obligations, gates, and role duties are the substance of
+`process.mdc` ("The process is mandatory"). An edit may **strengthen or
+clarify** them freely; **weakening** one is a change the **developer asks
+for explicitly** — never a byproduct of tidying, condensing,
+deduplicating, or restructuring.
+
+- **Modal wording is substance, not style.** "must", "never", and "only
+  the developer" carry the obligation — don't soften them to "should",
+  "prefer", or "consider" while improving tone or trimming length.
+- **A pointer must carry the obligation.** Replacing restated text with a
+  cross-reference is a deduplication only if the reader still lands on the
+  same "must" (see "Anti-redundancy"). A pointer that loses it is a
+  weakening.
+- **Obligations survive a move.** When a rule is moved, renamed, split, or
+  deleted, its gates and duties arrive intact at the new location — the
+  sweep that repairs references checks that none were dropped along the
+  way (see "Reference integrity on move").
+- **New steps declare their skippability.** A rule that adds or changes a
+  phase, stage, gate, or role duty states whether the step can be skipped
+  and by whom, with the developer as the only party who can authorize a
+  skip.
+
+When a cleanup pass turns up enforcement wording that looks excessive or
+redundant, **flag it for the developer** rather than trimming it.
+
+## Anti-redundancy
+
+**Single source of truth.** Cross-reference other rules instead of
+restating them. When you move behavior, leave a **pointer**, not a
+duplicate.
+
+## Definitions-consistency workflow
+
+When a term in `definitions.mdc` is added or changed, sweep the **whole
+ruleset** and update everything to use it consistently.
+
+## Cross-reference style
+
+- Core siblings → bare filename: `process.mdc`.
+- Subfolder files → path from `core/`: `roles/auditor.mdc`,
+  `planning/plans.mdc`.
+
+## Reference integrity on move
+
+Whenever a rule file is **moved, renamed, or deleted**, re-check **all**
+cross-references across the ruleset and update any that no longer resolve
+— repoint them at the new location (in the correct style above), or
+remove/repoint references to a deleted file. Leave **no dangling
+references**.
+
+## Editing mechanics
+
+Follow `core.mdc` (PowerShell `;` not `&&`; `Move-Item` / `Rename-Item`
+/ `Remove-Item` for file ops; specialized read/write/edit tools). Don't
+restate its tables here.
+
+## No testing needed
+
+Editing this ruleset has **nothing executable to test**, so it **skips
+the Testing phase**. "Verification" here means: `.mdc` files are
+lint-clean, cross-references resolve (see "Reference integrity on
+move"), and the change reads coherently — not running tests.
+
+## AGENTS.md template
+
+The repo root holds `AGENTS.template.md`, a scaffold for downstream
+projects. It is deliberately **not** named `AGENTS.md` so it stays inert
+here — Cursor auto-activates only a file literally named `AGENTS.md` (at
+root and in subdirectories). **Do not** rename it to `AGENTS.md` in this
+repo.
+
+If work reaches the **user/IRL testing step** in a project that has **no
+`AGENTS.md`**, **bug the developer** to create one from
+`AGENTS.template.md` before proceeding — the testing facts can't be
+followed if they were never captured. For the just-in-time prompt when
+IRL requirements are missing, see `testing/irl-testing.mdc`.

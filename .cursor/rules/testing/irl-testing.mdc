@@ -1,0 +1,92 @@
+---
+description: In-real-life (hardware-in-the-loop) testing — facts live in AGENTS.md, behavior lives here; agents produce the procedure and never claim IRL tests passed.
+alwaysApply: true
+---
+
+# In-Real-Life (IRL) Testing
+
+## What IRL testing is
+
+**IRL testing** = verification steps that require a **human** to perform
+a physical-world action or observation the agent **cannot do itself** —
+e.g. talking to hardware, pressing a reset button, connecting a cable,
+power-cycling a board, or watching a device's LEDs.
+
+## Facts live in AGENTS.md
+
+Whether a project needs IRL testing — and exactly what running it
+requires — is **declared in the project's root `AGENTS.md`**, not
+invented per session. This rule defines the **behavior**; `AGENTS.md`
+holds the per-project **facts**. Copy this snippet into `AGENTS.md` and
+fill it in:
+
+```markdown
+## IRL Testing
+- **Required?** yes / no
+- **Hardware / setup:** {devices, cables, jigs, firmware needed}
+- **Put system in a testable state:** {step-by-step to reach that state}
+- **Command(s) to run:** {exact commands}
+- **What a pass looks like:** {expected output / observation}
+- **Who does what:** {developer performs X; agent prepares / observes Y}
+- **IRL-facing paths:** {code paths / globs that require IRL testing}
+```
+
+## Ask just-in-time (don't nag)
+
+Before performing or **finalizing** an operation that would need IRL
+testing, if the project's IRL-testing requirements are **not documented**
+in `AGENTS.md`:
+
+- **Stop**, ask the developer for the missing facts, and **offer to
+  record them** in `AGENTS.md` using the snippet above.
+- Prompt at the **moment it's needed** — do not nag at session start.
+
+## Never fake it
+
+Agents **cannot** run IRL tests, so they must **never claim an IRL test
+passed**. Produce the IRL test **procedure** and hand it to the
+developer; IRL results are **developer-confirmed only**.
+
+## After a hardware/IRL run: stop, summarize, wait
+
+Even for commands the agent **can** run itself, if the command
+exercises real hardware or otherwise depends on physical state, then
+after it completes (success, failure, or timeout):
+
+1. **Stop.** Do not immediately re-run it, attempt a "fix", or move on
+   to the next step. **Never loop on a failing command.**
+2. **Summarize** briefly and concretely: what was run and against what;
+   the expected physical state; the observable result (phases reached,
+   errors, timeouts, key artifacts, exit status); interpretation —
+   pass / fail / partial / ambiguous.
+3. **Wait for the developer** before retrying, editing code based on the
+   result, or starting follow-up investigation.
+
+Hardware runs are slow, can leave devices in unexpected states, and
+often need a physical action before the next attempt makes sense. The
+per-project facts (which commands, expected states, what a pass looks
+like) live in `AGENTS.md`; see "Facts live in AGENTS.md" above.
+
+## Bottom-up backstop
+
+Any agent — organizer, doer, or lone agent — that modifies a code path
+`AGENTS.md` flags as hardware-/IRL-facing must **surface that IRL testing
+may be required**, even if its task prompt never mentioned it.
+
+## Where IRL steps go
+
+Surface the required manual IRL steps to the developer in the wrap-up
+**Follow-ups** section (see `human-interface/session-wrap-up-summary.mdc`).
+
+## Per-role responsibility
+
+Shared mechanics live here; each role states only its own duty:
+
+- **Organizer** — flags IRL tasks in the plan and propagates the flag
+  into doer prompts (see `roles/organizer.mdc`).
+- **Doer** — produces the IRL procedure and never marks IRL tests passed
+  (see `roles/doer.mdc`).
+- **Auditor** — runs only tests it actually can; flags IRL tests for the
+  developer instead of running or claiming them (see `roles/auditor.mdc`).
+- **Lone agent** — applies the same caveat to its self-verification (see
+  `roles/lone-agent.mdc`).
