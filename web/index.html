@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Subnet Traffic</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="header">
+  <div class="header-identity">
+    <h1 class="header-title">Subnet Traffic</h1>
+    <span class="header-subnet" id="subnet">192.168.2.0/24</span>
+    <span class="tag" id="mock-tag" hidden>simulated data</span>
+  </div>
+  <div class="header-status">
+    <span class="header-host" id="host-ip"></span>
+    <span class="header-count" id="device-count">0 devices</span>
+    <span class="connection" id="connection" data-state="connecting">
+      <span class="connection-dot" aria-hidden="true"></span>
+      <span id="connection-label">connecting</span>
+    </span>
+  </div>
+</header>
+
+<p class="banner" id="banner" role="status" hidden></p>
+
+<div class="scroll">
+  <p class="empty" id="empty-state">Waiting for traffic&hellip;</p>
+  <main class="rows" id="rows"></main>
+  <footer class="axis-row grid-row">
+    <div class="axis-gutter"></div>
+    <div class="axis" id="axis"></div>
+  </footer>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
