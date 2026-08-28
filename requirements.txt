@@ -1,5 +1,12 @@
-# Phase 1 has no runtime dependencies: the app runs on the standard library
-# alone. scapy arrives in Phase 2 for real packet capture.
+# Runtime. The upper bound is deliberate: reading the capture driver's
+# dropped-packet counters reaches through private scapy internals
+# (sock.pcap_fd.pcap) that carry no stability guarantee. It degrades to "drops
+# unknown" rather than crashing if that chain changes, but the pin keeps an
+# upgrade a decision rather than a surprise.
+scapy>=2.7.0,<2.8
+#
+# Npcap is a prerequisite, not a pip dependency: it is a Windows system driver,
+# installed separately from npcap.com.
 #
 # Development / test only:
 pytest
