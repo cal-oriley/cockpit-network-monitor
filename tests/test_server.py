@@ -7,6 +7,7 @@ depends on real time.
 """
 
 import json
+import socket
 import subprocess
 import sys
 import threading
@@ -21,7 +22,7 @@ from http import HTTPStatus
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import pytest
 
@@ -37,6 +38,7 @@ from netmon.capture import (
 from netmon.mock_source import MockSource
 from netmon.rate_window import RateWindow
 from netmon.server import (
+    BIND_ADVICE,
     CAPTURE_STATE_DETAILS,
     CAPTURE_STATE_ERROR,
     CAPTURE_STATE_MOCK,
@@ -44,12 +46,14 @@ from netmon.server import (
     DEFAULT_HOST_IP,
     DEFAULT_PORT,
     DEFAULT_SUBNET,
+    EXCLUSIVE_PORTS_AVAILABLE,
     JSON_CONTENT_TYPE,
     NO_STORE,
     RATES_PATH,
     SUBNET_PARAM,
     UNKNOWN_CAPTURE_DETAIL,
     CaptureStatusReader,
+    ExclusivePortHTTPServer,
     RatesRequestHandler,
     build_parser,
     build_source,
@@ -90,6 +94,19 @@ LOOPBACK = "127.0.0.1"
 EPHEMERAL_PORT = 0
 REQUEST_TIMEOUT_S = 5.0
 SHUTDOWN_TIMEOUT_S = 5.0
+
+RESTART_CYCLES = 3
+SERVER_MODULE = "netmon.server"
+# Only ever waited out by a server that wrongly stays up, since a refused start
+# returns at once.
+STARTUP_TIMEOUT_S = 20.0
+# Stock ``ThreadingHTTPServer`` stands in for a server left over from an older
+# build, which is how the port came to be occupied in the first place.
+INCUMBENT_SERVERS = [ThreadingHTTPServer, ExclusivePortHTTPServer]
+SHARED_PORTS_REASON = (
+    "Only Windows lets a second socket bind a port already in LISTEN, so only "
+    "there can a server be started that receives nothing."
+)
 
 DEFAULT_SUBNET_IPS = ("192.168.2.2", "192.168.2.10")
 SECOND_SUBNET_IPS = ("10.11.12.2", "10.11.12.3")
@@ -185,7 +202,7 @@ def run_main(
         built.append(stub)
         return stub
 
-    monkeypatch.setattr(server, "ThreadingHTTPServer", build)
+    monkeypatch.setattr(server, "ExclusivePortHTTPServer", build)
     code = server.main(argv)
     return code, built[0]
 
@@ -217,6 +234,8 @@ def serving(
     window: RateWindow,
     default_subnet: str = DEFAULT_SUBNET,
     read_capture_status: CaptureStatusReader | None = None,
+    port: int = EPHEMERAL_PORT,
+    server_class: type[ThreadingHTTPServer] = ThreadingHTTPServer,
 ) -> Iterator[str]:
     """Run the handler on a loopback port and yield its base URL."""
     handler = partial(
@@ -227,7 +246,7 @@ def serving(
         or partial(capture_status_for, CAPTURE_STATE_MOCK),
         default_subnet=parse_subnet(default_subnet),
     )
-    httpd = ThreadingHTTPServer((LOOPBACK, EPHEMERAL_PORT), handler)
+    httpd = server_class((LOOPBACK, port), handler)
     httpd.daemon_threads = True
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
@@ -237,6 +256,20 @@ def serving(
         httpd.shutdown()
         httpd.server_close()
         thread.join(SHUTDOWN_TIMEOUT_S)
+
+
+def port_of(base_url: str) -> int:
+    """The port a ``serving`` base URL was handed."""
+    port = urlsplit(base_url).port
+    assert port is not None
+    return port
+
+
+def free_loopback_port() -> int:
+    """A loopback port nothing holds, released before it is returned."""
+    with socket.socket() as probe:
+        probe.bind((LOOPBACK, EPHEMERAL_PORT))
+        return probe.getsockname()[1]
 
 
 def fetch_rates(base_url: str, subnet: str | None = None) -> Response:
@@ -552,6 +585,64 @@ def test_an_unusable_default_subnet_fails_at_startup(
 
     assert exit_info.value.code != 0
     assert "CIDR" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(not EXCLUSIVE_PORTS_AVAILABLE, reason=SHARED_PORTS_REASON)
+@pytest.mark.parametrize("incumbent", INCUMBENT_SERVERS)
+def test_a_port_already_being_served_is_refused_at_startup(
+    clock: FakeClock, incumbent: type[ThreadingHTTPServer]
+) -> None:
+    """The regression guard for a second server that receives nothing.
+
+    Windows hands a port already in LISTEN to a second socket, so the server
+    just started sits idle while the one already there answers every poll -
+    which the page cannot tell apart from working software serving the wrong
+    data. Starting has to fail instead, name the address, and exit non-zero.
+
+    Run as its own process because that is what the failure looks like: a
+    server that gets this wrong does not return at all, it serves nobody
+    forever, so the timeout is the assertion that it exited.
+    """
+    with serving(
+        populated_window(clock), port=free_loopback_port(), server_class=incumbent
+    ) as base_url:
+        port = port_of(base_url)
+        rival = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                SERVER_MODULE,
+                "--mock",
+                "--host",
+                LOOPBACK,
+                "--port",
+                str(port),
+            ],
+            capture_output=True,
+            text=True,
+            cwd=REPO_ROOT,
+            timeout=STARTUP_TIMEOUT_S,
+        )
+
+    assert rival.returncode != 0
+    assert f"{LOOPBACK}:{port}" in rival.stderr
+    assert BIND_ADVICE in rival.stderr
+
+
+def test_a_port_just_released_can_be_served_again_at_once(clock: FakeClock) -> None:
+    """Refusing to share a port must not also refuse a restart.
+
+    Stop and start again on the same port is the every-few-minutes loop of
+    working on this program, so a bind that had to wait out the sockets the
+    previous run left behind would cost more than the hijack it prevents.
+    """
+    port = free_loopback_port()
+
+    for _ in range(RESTART_CYCLES):
+        with serving(
+            populated_window(clock), port=port, server_class=ExclusivePortHTTPServer
+        ) as base_url:
+            assert fetch_rates(base_url).status == HTTPStatus.OK
 
 
 def test_the_mock_flag_selects_synthetic_traffic(clock: FakeClock) -> None:

@@ -11,6 +11,7 @@ which a 2 Hz poll from a handful of browser tabs does not strain. Upgrade path
 import argparse
 import ipaddress
 import json
+import socket
 import sys
 from collections.abc import Callable, Iterable, Sequence
 from functools import partial
@@ -47,6 +48,18 @@ JSON_CONTENT_TYPE = "application/json"
 NO_STORE = "no-store"
 
 SUBNET_ADVICE = f"Enter a subnet in CIDR form, such as {DEFAULT_SUBNET}."
+BIND_ADVICE = "Another server may already be running on this port."
+
+# Windows and Unix disagree about what SO_REUSEADDR permits, and the difference
+# is the whole reason this is not just the stock server. On Unix it only lets a
+# port lingering in TIME_WAIT be rebound; a live listener still cannot be
+# hijacked, so it is genuinely wanted there and a restart is never blocked. On
+# Windows it also lets a second socket bind a port that is already in LISTEN,
+# and which of the two processes then receives a given connection is undefined:
+# a stale server goes on answering while the one just started receives nothing.
+# SO_EXCLUSIVEADDRUSE, which exists only on Windows, is the documented way to
+# refuse that bind, and it does not stand in the way of an immediate restart.
+EXCLUSIVE_PORTS_AVAILABLE = hasattr(socket, "SO_EXCLUSIVEADDRUSE")
 
 IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
 
@@ -254,6 +267,24 @@ class RatesRequestHandler(SimpleHTTPRequestHandler):
             self.close_connection = True
 
 
+class ExclusivePortHTTPServer(ThreadingHTTPServer):
+    """A server that refuses to share its port with one already serving it.
+
+    Starting a second server on a busy port has to fail loudly: a server that
+    binds but is never handed a connection looks exactly like working software
+    serving stale data, which is far more expensive to diagnose than a refused
+    start. See ``EXCLUSIVE_PORTS_AVAILABLE`` for why the option differs by
+    platform.
+    """
+
+    allow_reuse_address = not EXCLUSIVE_PORTS_AVAILABLE
+
+    def server_bind(self) -> None:
+        if EXCLUSIVE_PORTS_AVAILABLE:
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Command-line interface for ``python -m netmon.server``."""
     parser = argparse.ArgumentParser(
@@ -337,9 +368,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         default_subnet=default_subnet,
     )
     try:
-        server = ThreadingHTTPServer((args.host, args.port), handler)
+        server = ExclusivePortHTTPServer((args.host, args.port), handler)
     except OSError as error:
-        print(f"Cannot bind {args.host}:{args.port}: {error}", file=sys.stderr)
+        print(
+            f"Cannot bind {args.host}:{args.port}: {error}\n{BIND_ADVICE}",
+            file=sys.stderr,
+        )
         return 1
     server.daemon_threads = True
 
