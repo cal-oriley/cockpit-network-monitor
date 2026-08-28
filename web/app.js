@@ -3,8 +3,10 @@
  *
  * The server owns the rolling window, so this page holds no history: every poll
  * carries a complete, bucket-aligned series per device and the page simply
- * redraws it. Rows are reconciled by IP rather than rebuilt, so a canvas is
- * never thrown away and rows never flicker or reorder under the cursor.
+ * redraws it. Rows are reconciled by IP rather than rebuilt, so only the rows
+ * that actually appear or leave touch the DOM and the rest never flicker or
+ * reorder under the cursor. The watched subnet travels the other way, from the
+ * header's field up to the server as `?subnet=`.
  */
 (() => {
   'use strict';
@@ -16,11 +18,24 @@
   const RATES_URL = 'api/rates';
 
   const POLL_INTERVAL_MS = 500;
+  const IMMEDIATE_POLL_MS = 0;
   const MAX_BACKOFF_MS = 2000;
   const BACKOFF_FACTOR = 2;
   const REQUEST_TIMEOUT_MS = 2000;
   const STALE_IDLE_MS = 2000;
   const MS_PER_SECOND = 1000;
+
+  /* A rejected subnet is answered with 400, which means the server is alive and
+     disagreeing with the input - not a lost connection. */
+  const HTTP_BAD_REQUEST = 400;
+
+  const SUBNET_QUERY_PARAM = 'subnet';
+  const SUBNET_STORAGE_KEY = 'netmon.subnet';
+
+  /* Shape check only, used to reject junk read back out of localStorage. The
+     server is the authority on what a valid subnet is, and answers anything it
+     dislikes with a sentence worth showing. */
+  const SUBNET_SHAPE = /^\d{1,3}(?:\.\d{1,3}){3}\/\d{1,2}$/;
 
   /* capture.state values this page reacts to. Every other value - including
      ones a later phase invents - falls through to the warning banner, which is
@@ -39,9 +54,6 @@
   const GRAPH_LINE_WIDTH_PX = 1;
   const MIN_Y_SCALE_PPS = 1;
 
-  const SUBNET_PREFIX_OCTETS = 3;
-  const IPV4_OCTETS = 4;
-
   const TEXT = Object.freeze({
     connection: Object.freeze({
       [CONNECTION_CONNECTING]: 'connecting',
@@ -49,7 +61,6 @@
       [CONNECTION_DISCONNECTED]: 'disconnected',
     }),
     deviceCount: (count) => `${count} ${count === 1 ? 'device' : 'devices'}`,
-    subnet: (prefix) => `${prefix}.0/24`,
     rate: (pps) => `${formatRate(pps)} pps`,
     peak: (pps) => `peak ${formatRate(pps)}`,
     noTraffic: 'NO TRAFFIC',
@@ -58,6 +69,7 @@
     graphLabel: (ip, pps) => `${ip}: ${formatRate(pps)} packets per second`,
     graphLabelStale: (ip) => `${ip}: no traffic`,
     captureFallback: (state) => `Packet capture unavailable (${state}).`,
+    subnetRejected: 'The server rejected that subnet.',
     malformedPayload: 'Malformed /api/rates payload',
     disconnected: 'Lost contact with /api/rates; retrying.',
   });
@@ -66,6 +78,7 @@
 
   const els = Object.freeze({
     subnet: document.getElementById('subnet'),
+    subnetError: document.getElementById('subnet-error'),
     hostIp: document.getElementById('host-ip'),
     deviceCount: document.getElementById('device-count'),
     mockTag: document.getElementById('mock-tag'),
@@ -91,6 +104,9 @@
   let connectionState = CONNECTION_CONNECTING;
   let nextDelayMs = POLL_INTERVAL_MS;
   let pollTimer = null;
+
+  /** Subnet sent as `?subnet=`; `null` leaves the choice to the server. */
+  let requestedSubnet = loadStoredSubnet();
 
   // ── Formatting ──────────────────────────────────────────────────────────
 
@@ -248,13 +264,7 @@
 
   function updateHeader(payload, deviceCount) {
     const hostIp = typeof payload.host_ip === 'string' ? payload.host_ip : '';
-    if (hostIp) {
-      els.hostIp.textContent = hostIp;
-      const octets = hostIp.split('.');
-      if (octets.length === IPV4_OCTETS) {
-        els.subnet.textContent = TEXT.subnet(octets.slice(0, SUBNET_PREFIX_OCTETS).join('.'));
-      }
-    }
+    if (hostIp) els.hostIp.textContent = hostIp;
     els.deviceCount.textContent = TEXT.deviceCount(deviceCount);
   }
 
@@ -277,6 +287,86 @@
       els.banner.textContent = detail || TEXT.captureFallback(state);
     }
     els.banner.hidden = !degraded;
+  }
+
+  // ── Subnet control ──────────────────────────────────────────────────────
+
+  /**
+   * Read the last committed subnet back out of storage.
+   *
+   * Storage can be unavailable altogether inside an iframe, and what it holds
+   * is whatever a previous session or another page left there, so anything that
+   * is not subnet-shaped is treated as absent: startup falls back to the
+   * server's default rather than breaking.
+   */
+  function loadStoredSubnet() {
+    try {
+      const stored = window.localStorage.getItem(SUBNET_STORAGE_KEY);
+      return typeof stored === 'string' && SUBNET_SHAPE.test(stored) ? stored : null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  /** Persist only plausible values, so a reload never starts in an error state. */
+  function storeSubnet(subnet) {
+    try {
+      if (SUBNET_SHAPE.test(subnet)) window.localStorage.setItem(SUBNET_STORAGE_KEY, subnet);
+      else window.localStorage.removeItem(SUBNET_STORAGE_KEY);
+    } catch (error) {
+      /* Nothing to recover: the subnet still applies for this session. */
+    }
+  }
+
+  /**
+   * Show the field the effective subnet the payload was filtered to, so the
+   * header reflects the server's normalized answer rather than what was typed.
+   * Skipped while the field has focus, so a poll cannot overwrite an edit in
+   * progress.
+   */
+  function renderSubnet(subnet) {
+    if (typeof subnet !== 'string' || !subnet) return;
+    if (document.activeElement !== els.subnet) els.subnet.value = subnet;
+  }
+
+  function showSubnetError(sentence) {
+    els.subnetError.textContent = sentence;
+    els.subnetError.hidden = false;
+    els.subnet.setAttribute('aria-invalid', 'true');
+  }
+
+  function clearSubnetError() {
+    if (els.subnetError.hidden) return;
+    els.subnetError.textContent = '';
+    els.subnetError.hidden = true;
+    els.subnet.removeAttribute('aria-invalid');
+  }
+
+  /**
+   * Adopt the field's value as the subnet sent on subsequent polls. Bound to
+   * `change`, which fires on Enter and on a blur that followed an edit - never
+   * per keystroke, so a half-typed CIDR is not polled with.
+   */
+  function commitSubnet() {
+    const subnet = els.subnet.value.trim();
+    if (subnet === requestedSubnet) return;
+    requestedSubnet = subnet;
+    storeSubnet(subnet);
+    nextDelayMs = POLL_INTERVAL_MS;
+    scheduleNextPoll(IMMEDIATE_POLL_MS);
+  }
+
+  function initSubnetControl() {
+    /* A stored subnet is shown before the first poll answers, so a reload
+       inside Cockpit never flashes the default it is not going to use. */
+    if (requestedSubnet !== null) els.subnet.value = requestedSubnet;
+
+    els.subnet.addEventListener('change', commitSubnet);
+    els.subnet.addEventListener('keydown', (event) => {
+      /* Leaving the field on Enter lets the normalized subnet render straight
+         back into it, since renderSubnet holds off while it is focused. */
+      if (event.key === 'Enter') els.subnet.blur();
+    });
   }
 
   // ── Row reconciliation ──────────────────────────────────────────────────
@@ -326,6 +416,11 @@
     return view;
   }
 
+  /**
+   * Every poll redraws, whatever the numbers say. A silent device's window
+   * still scrolls, so staleness only dims the row and reveals its badge - it
+   * never pauses the drawing that carries the trace along the baseline.
+   */
   function updateRowView(view, device) {
     const currentPps = numberOr(device.current_pps, 0);
     view.series = normalizeSeries(device.pps);
@@ -343,15 +438,19 @@
     drawGraph(view);
   }
 
+  function destroyRowView(view) {
+    resizeObserver.unobserve(view.canvas);
+    canvasOwners.delete(view.canvas);
+    view.element.remove();
+  }
+
   /**
-   * Create rows for unseen IPs and update the rest in place, then move any
-   * out-of-position element so the DOM matches the payload's numeric IP order.
-   * Rows are never removed: the contract keeps a device for the process
-   * lifetime, so a quiet device reads as a flatline instead of a vanished row.
-   *
-   * ponytail: a server restart therefore leaves its old rows on screen until
-   * the page is reloaded. Ceiling accepted for Phase 1; the upgrade path is a
-   * process-identity field in the payload that the client can compare against.
+   * Reconcile the grid against `devices` in one pass by IP: create rows for
+   * unseen IPs, update the rest in place, drop the ones the payload no longer
+   * lists, and move any out-of-position element so the DOM matches the
+   * payload's numeric IP order. A device that falls outside the current subnet
+   * simply stops being listed and leaves through this same path, taking only
+   * its own canvas with it - the surviving rows keep theirs.
    */
   function reconcileRows(devices) {
     const orderedIps = [];
@@ -367,6 +466,13 @@
       orderedIps.push(device.ip);
     }
 
+    const listed = new Set(orderedIps);
+    for (const [ip, view] of rowViews) {
+      if (listed.has(ip)) continue;
+      destroyRowView(view);
+      rowViews.delete(ip);
+    }
+
     orderedIps.forEach((ip, index) => {
       const view = rowViews.get(ip);
       const occupant = els.rows.children[index];
@@ -379,13 +485,37 @@
 
   // ── Polling ─────────────────────────────────────────────────────────────
 
-  async function fetchRates() {
+  function ratesUrl(subnet) {
+    if (subnet === null) return RATES_URL;
+    return `${RATES_URL}?${new URLSearchParams({ [SUBNET_QUERY_PARAM]: subnet })}`;
+  }
+
+  /** The sentence a 400 carries, falling back if the body is not the error shape. */
+  async function readRejection(response) {
+    try {
+      const body = await response.json();
+      const sentence = body && typeof body.error === 'string' ? body.error.trim() : '';
+      return sentence || TEXT.subnetRejected;
+    } catch (error) {
+      return TEXT.subnetRejected;
+    }
+  }
+
+  /**
+   * @returns {Promise<{payload: object}|{rejection: string}>} A rejection is a
+   * subnet the server refused; anything else that goes wrong throws.
+   */
+  async function fetchRates(subnet) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     try {
-      const response = await fetch(RATES_URL, { cache: 'no-store', signal: controller.signal });
+      const response = await fetch(ratesUrl(subnet), {
+        cache: 'no-store',
+        signal: controller.signal,
+      });
+      if (response.status === HTTP_BAD_REQUEST) return { rejection: await readRejection(response) };
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      return await response.json();
+      return { payload: await response.json() };
     } finally {
       clearTimeout(timeout);
     }
@@ -393,6 +523,7 @@
 
   function applyPayload(payload) {
     renderCaptureStatus(payload.capture);
+    renderSubnet(payload.subnet);
     renderAxis(readWindowMs(payload));
     const devices = Array.isArray(payload.devices) ? payload.devices : [];
     const deviceCount = reconcileRows(devices);
@@ -400,13 +531,27 @@
   }
 
   async function pollOnce() {
+    const subnet = requestedSubnet;
     try {
-      const payload = await fetchRates();
-      if (!payload || typeof payload !== 'object') throw new Error(TEXT.malformedPayload);
-      applyPayload(payload);
+      const result = await fetchRates(subnet);
+      /* A commit landed mid-flight, so this answer describes the previous
+         subnet and the commit has already scheduled the poll that replaces it. */
+      if (subnet !== requestedSubnet) return;
+
+      if (result.rejection !== undefined) {
+        /* The server is answering, so the connection is healthy and the rows on
+           screen stay exactly as they are - only the field is marked wrong. */
+        showSubnetError(result.rejection);
+      } else {
+        const payload = result.payload;
+        if (!payload || typeof payload !== 'object') throw new Error(TEXT.malformedPayload);
+        clearSubnetError();
+        applyPayload(payload);
+      }
       setConnection(CONNECTION_LIVE);
       nextDelayMs = POLL_INTERVAL_MS;
     } catch (error) {
+      if (subnet !== requestedSubnet) return;
       /* Rows, the axis, and the banner are all left standing: a dropped poll
          means the page is stale, not that the devices went away. */
       if (connectionState !== CONNECTION_DISCONNECTED) {
@@ -423,5 +568,6 @@
     pollTimer = setTimeout(pollOnce, delayMs);
   }
 
+  initSubnetControl();
   pollOnce();
 })();

@@ -12,7 +12,12 @@
 <header class="header">
   <div class="header-identity">
     <h1 class="header-title">Subnet Traffic</h1>
-    <span class="header-subnet" id="subnet">192.168.2.0/24</span>
+    <div class="subnet-field">
+      <input class="subnet-input" id="subnet" type="text" spellcheck="false" autocomplete="off"
+             placeholder="192.168.2.0/24" aria-label="Watched subnet"
+             aria-describedby="subnet-error">
+      <span class="subnet-error" id="subnet-error" role="alert" hidden></span>
+    </div>
     <span class="tag" id="mock-tag" hidden>simulated data</span>
   </div>
   <div class="header-status">

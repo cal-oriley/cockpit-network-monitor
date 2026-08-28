@@ -39,6 +39,8 @@
 
   /* Shared geometry */
   --label-w: 12rem;
+  --subnet-input-w: 9.5rem;
+  --subnet-error-max-w: 22rem;
   --col-gap: 1rem;
   --page-pad-x: 0.75rem;
   --row-pad-x: 0.75rem;
@@ -104,7 +106,6 @@ body {
   letter-spacing: 0.01em;
 }
 
-.header-subnet,
 .header-host,
 .header-count {
   font-family: var(--font-mono);
@@ -112,8 +113,62 @@ body {
   color: var(--text-dim);
 }
 
-.header-subnet {
+/* ── Subnet control ─────────────────────────────────────────────────────── */
+
+/*
+ * The field is the control for what the page watches, so it has to read as
+ * interactive without shouting inside Cockpit's header: it sits at rest as a
+ * faintly outlined chip and only lifts on hover and focus.
+ */
+
+.subnet-field {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.25rem 0.5rem;
+  min-width: 0;
+}
+
+.subnet-input {
+  width: var(--subnet-input-w);
+  padding: 0.1rem 0.4rem;
+  border: 1px solid var(--card-border);
+  border-radius: 4px;
+  background: var(--card);
   color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  transition: border-color 150ms ease, background-color 150ms ease, color 150ms ease;
+}
+
+.subnet-input::placeholder {
+  color: var(--text-faint);
+}
+
+.subnet-input:hover {
+  background: var(--card-hover);
+  border-color: var(--text-faint);
+}
+
+.subnet-input:focus {
+  background: var(--card-hover);
+  border-color: var(--accent);
+}
+
+.subnet-input:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.subnet-input[aria-invalid="true"] {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.subnet-error {
+  max-width: var(--subnet-error-max-w);
+  color: var(--danger);
+  font-size: 0.72rem;
 }
 
 .tag {
