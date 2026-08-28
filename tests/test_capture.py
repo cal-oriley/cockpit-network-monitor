@@ -16,6 +16,7 @@ in the field.
 import importlib.util
 import subprocess
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +62,7 @@ PERMISSION_MESSAGE = (
     "that device"
 )
 FAILURE_MESSAGE = "libpcap said no"
+REFUSED_RECORDING_MESSAGE = "ip must be a non-empty string"
 SHORT_START_TIMEOUT_S = 0.1
 TRUNCATED_FRAME = b"\x00" * 20
 
@@ -107,10 +109,13 @@ class FakeSniffer:
         self.alive = True
         self.confirm_start = True
         self.start_error: BaseException | None = None
+        self.start_raises: BaseException | None = None
         self.stop_error: BaseException | None = None
         self.stopped_with: float | None = None
 
     def start(self) -> None:
+        if self.start_raises is not None:
+            raise self.start_raises
         # scapy sets running before opening the socket, so a setup failure
         # leaves it True on a thread that is already gone.
         self.running = True
@@ -196,6 +201,22 @@ class FakePacket:
             raise IndexError(f"Layer [{name!r}] not found") from None
 
 
+class RefusingWindow:
+    """An aggregator that rejects whatever it is handed.
+
+    ``RateWindow.record`` raises ``ValueError`` for an empty address or a
+    non-positive packet count, so refusing is faithful to its contract.
+    """
+
+    def __init__(self, error: BaseException) -> None:
+        self._error = error
+        self.calls = 0
+
+    def record(self, ip: str, packets: int = 1) -> None:
+        self.calls += 1
+        raise self._error
+
+
 @pytest.fixture
 def on_windows(monkeypatch: pytest.MonkeyPatch) -> None:
     """Run the lifecycle tests as though this were the target platform."""
@@ -231,6 +252,126 @@ class FakeInterface:
     def __init__(self, network_name: str, *addresses: str) -> None:
         self.network_name = network_name
         self.ips = {4: list(addresses), 6: []}
+
+
+class FakeIfaceTable:
+    """scapy's ``conf.ifaces``, which holds its adapters in ``data``."""
+
+    def __init__(self, interfaces: Iterable[FakeInterface]) -> None:
+        self.data = {
+            interface.network_name: interface for interface in interfaces
+        }
+
+
+class FakePcapListenSocket:
+    """Stands in for scapy's libpcap listen socket."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeNativeListenSocket:
+    """scapy's own Windows socket - the substitution that must be refused.
+
+    It cannot see incoming TCP at all, so a capture that silently ended up on
+    it would look healthy while seeing almost nothing.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+
+
+class FakeAsyncSniffer:
+    """Stands in for the ``AsyncSniffer`` the pcap sniffer wraps."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+        self.exception: BaseException | None = None
+        self.thread: FakeThread | None = None
+        self.started = False
+        self.stopped = False
+
+    def start(self) -> None:
+        self.started = True
+
+    def stop(self, join: bool = True) -> None:
+        self.stopped = True
+
+
+class UnbuildableAsyncSniffer:
+    """A sniffer that cannot be constructed around an already-open socket."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        raise RuntimeError(FAILURE_MESSAGE)
+
+
+class FakeConf:
+    """The slice of scapy's ``conf`` the pcap layer reads.
+
+    ``L2listen`` is a class rather than a factory because the module checks
+    what it *is*, not just what it returns.
+    """
+
+    def __init__(
+        self,
+        listen_socket: object = FakePcapListenSocket,
+        use_pcap: bool = True,
+        interfaces: Iterable[FakeInterface] = (),
+    ) -> None:
+        self.L2listen = listen_socket
+        self.use_pcap = use_pcap
+        self.ifaces = FakeIfaceTable(interfaces)
+        # scapy's idea of the primary adapter, which on a laptop is the Wi-Fi
+        # card. Nothing here is allowed to fall back to it.
+        self.iface = OTHER_IFACE
+
+
+def recording_listen_socket(opened: list[FakePcapListenSocket]) -> type:
+    """A pcap listen-socket class that reports the sockets it opens."""
+
+    class RecordingListenSocket(FakePcapListenSocket):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            opened.append(self)
+
+    return RecordingListenSocket
+
+
+def install_pcap_layer(
+    monkeypatch: pytest.MonkeyPatch, conf: FakeConf | None = None
+) -> FakeConf:
+    """Put scapy-free stand-ins behind the module's lazy scapy accessors.
+
+    Faking the accessors rather than scapy itself is what keeps these tests off
+    ``import scapy.all``, which costs seconds and which the pure-logic suite
+    has to run without.
+    """
+    conf = FakeConf() if conf is None else conf
+    monkeypatch.setattr(capture, "_scapy_conf", lambda: conf)
+    monkeypatch.setattr(capture, "_async_sniffer_class", lambda: FakeAsyncSniffer)
+    monkeypatch.setattr(
+        capture, "_pcap_listen_socket_class", lambda: FakePcapListenSocket
+    )
+    return conf
+
+
+def ignore_packet(packet: Any) -> None:
+    """Callback for the tests that only care how the sniffer was built."""
+
+
+def ignore_start() -> None:
+    """Start confirmation for those same tests."""
+
+
+def build_pcap_sniffer() -> capture._PcapSniffer:
+    """The real ``_PcapSniffer``, over whatever pcap layer is installed."""
+    return capture._PcapSniffer(
+        IFACE, filter_for(HOST_IP), ignore_packet, ignore_start
+    )
 
 
 # --------------------------------------------------------------------------
@@ -300,6 +441,35 @@ def test_two_adapters_sharing_an_address_resolve_deterministically() -> None:
 
     assert chosen == OTHER_IFACE
     assert select_interface(HOST_IP, list(reversed(interfaces))) == chosen
+
+
+def test_the_adapter_table_is_read_from_scapy_when_none_is_supplied(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The production path, which every other test here bypasses."""
+    conf = FakeConf(
+        interfaces=[
+            FakeInterface(OTHER_IFACE, "192.168.1.219"),
+            FakeInterface(IFACE, HOST_IP),
+        ]
+    )
+    monkeypatch.setattr(capture, "_scapy_conf", lambda: conf)
+
+    chosen = select_interface(HOST_IP)
+
+    assert chosen == IFACE
+    assert chosen != conf.iface
+
+
+def test_scapys_own_primary_adapter_is_never_a_fallback(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``conf.iface`` is the Wi-Fi card here, so falling back to it would draw
+    the house LAN as plausible vehicle rows."""
+    conf = FakeConf(interfaces=[FakeInterface(OTHER_IFACE, "192.168.1.219")])
+    monkeypatch.setattr(capture, "_scapy_conf", lambda: conf)
+
+    assert select_interface(HOST_IP) is None
 
 
 # --------------------------------------------------------------------------
@@ -636,6 +806,27 @@ def test_stopping_releases_the_sniffer_and_passes_the_timeout(
     assert source.status().state == CAPTURE_STATE_NOT_RUNNING
 
 
+def test_a_sniffer_that_raises_on_starting_can_still_be_stopped(
+    on_windows: None, window: RateWindow
+) -> None:
+    """Its libpcap handle exists from the moment it was built.
+
+    ``AsyncSniffer.start()`` is not known to raise, but if it ever did, a
+    sniffer the source had not kept hold of would leave that handle
+    unreachable - ``stop()`` is the only thing that can release it.
+    """
+    factory = FakeSnifferFactory(start_raises=RuntimeError(FAILURE_MESSAGE))
+    source = build_source(window, factory)
+
+    source.start()
+    status = source.status()
+    source.stop()
+
+    assert status.state == CAPTURE_STATE_ERROR
+    assert FAILURE_MESSAGE in status.detail
+    assert factory.sniffer.stopped_with == capture.STOP_TIMEOUT_S
+
+
 def test_stopping_a_sniffer_that_is_already_dead_never_raises(
     on_windows: None, window: RateWindow
 ) -> None:
@@ -707,6 +898,56 @@ def test_an_unreadable_frame_does_not_stop_later_ones_being_counted(
     factory.sniffer.on_packet(FakePacket(IP=FakeLayer(DEVICE_IP)))
 
     assert recorded_addresses(window) == [DEVICE_IP]
+
+
+@pytest.mark.parametrize(
+    "error", [ValueError(REFUSED_RECORDING_MESSAGE), RuntimeError(FAILURE_MESSAGE)]
+)
+def test_an_aggregator_that_refuses_a_recording_does_not_end_the_capture(
+    on_windows: None, error: BaseException
+) -> None:
+    """The other half of the callback's guard, and the harder half to reach.
+
+    Every frame that cannot be read fails earlier, at extraction, so the only
+    way ``record`` itself raises is a value it rejects - and one exception
+    escaping here would end the capture permanently, leaving every device
+    scrolling along the baseline as though it had simply gone quiet.
+    """
+    window = RefusingWindow(error)
+    factory = FakeSnifferFactory()
+    source = CaptureSource(
+        window, HOST_IP, iface=IFACE, sniffer_factory=factory
+    )
+    source.start()
+
+    factory.sniffer.on_packet(FakePacket(IP=FakeLayer(DEVICE_IP)))
+    status = source.status()
+
+    assert window.calls == 1
+    assert status.state == CAPTURE_STATE_OK
+    assert source.running is True
+
+
+def test_a_refused_recording_is_described_as_what_it_was(
+    on_windows: None
+) -> None:
+    """An address was read; recording it is what failed.
+
+    The sentence reaches an ROV operator verbatim, so it has to be true of
+    both the frame with no readable address and the address that was rejected.
+    """
+    factory = FakeSnifferFactory()
+    source = CaptureSource(
+        RefusingWindow(ValueError(REFUSED_RECORDING_MESSAGE)),
+        HOST_IP,
+        iface=IFACE,
+        sniffer_factory=factory,
+    )
+    source.start()
+
+    factory.sniffer.on_packet(FakePacket(IP=FakeLayer(DEVICE_IP)))
+
+    assert "1 packets could not be attributed" in source.status().detail
 
 
 def test_unattributable_packets_are_counted_and_surfaced(
@@ -931,6 +1172,128 @@ def test_a_sniffer_with_no_drop_counters_still_reports_ok(
     source.start()
 
     assert source.status().state == CAPTURE_STATE_OK
+
+
+# --------------------------------------------------------------------------
+# The pcap layer, faked rather than imported
+# --------------------------------------------------------------------------
+
+
+def test_a_scapy_that_will_capture_through_libpcap_is_accepted(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conf = install_pcap_layer(monkeypatch)
+
+    assert capture._require_pcap() is conf
+
+
+def test_a_scapy_without_the_libpcap_binding_reports_npcap_missing(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Failing to load pcap at all is exactly the npcap_missing condition."""
+
+    def missing() -> type:
+        raise ImportError("No module named 'scapy.arch.libpcap'")
+
+    install_pcap_layer(monkeypatch)
+    monkeypatch.setattr(capture, "_pcap_listen_socket_class", missing)
+
+    with pytest.raises(NpcapMissingError, match="npcap.com"):
+        capture._require_pcap()
+
+
+def test_a_scapy_that_would_not_use_pcap_reports_npcap_missing(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_pcap_layer(monkeypatch, FakeConf(use_pcap=False))
+
+    with pytest.raises(NpcapMissingError):
+        capture._require_pcap()
+
+
+@pytest.mark.parametrize(
+    "listen_socket", [FakeNativeListenSocket, FakeNativeListenSocket()]
+)
+def test_a_substituted_listen_socket_reports_npcap_missing(
+    monkeypatch: pytest.MonkeyPatch, listen_socket: object
+) -> None:
+    """``conf.use_pcap`` alone does not prove the socket class came from pcap.
+
+    scapy's own Windows socket cannot see incoming TCP, so a silent
+    substitution would present itself as a working capture that sees almost
+    nothing.
+    """
+    install_pcap_layer(monkeypatch, FakeConf(listen_socket=listen_socket))
+
+    with pytest.raises(NpcapMissingError):
+        capture._require_pcap()
+
+
+def test_the_capture_socket_is_opened_without_promiscuous_mode(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``conf.sniff_promisc`` defaults to True and the socket falls back to it.
+
+    Left implicit, this would put the adapter into promiscuous mode and
+    contradict the program's own claim to be a pure listener on one address.
+    """
+    install_pcap_layer(monkeypatch)
+
+    sniffer = build_pcap_sniffer()
+
+    assert sniffer._socket.kwargs == {
+        "iface": IFACE,
+        "filter": filter_for(HOST_IP),
+        "promisc": False,
+    }
+
+
+def test_the_sniffer_reads_from_the_socket_we_opened(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drop counters are only reachable through a socket of our own, which is
+    why ``opened_socket`` is used in production rather than ``iface``."""
+    install_pcap_layer(monkeypatch)
+
+    sniffer = build_pcap_sniffer()
+
+    assert sniffer._sniffer.kwargs == {
+        "opened_socket": sniffer._socket,
+        "prn": ignore_packet,
+        "store": False,
+        "started_callback": ignore_start,
+    }
+
+
+def test_a_sniffer_that_cannot_be_built_releases_the_socket(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``AsyncSniffer`` closes only sockets it opened itself."""
+    opened: list[FakePcapListenSocket] = []
+    install_pcap_layer(
+        monkeypatch, FakeConf(listen_socket=recording_listen_socket(opened))
+    )
+    monkeypatch.setattr(
+        capture, "_async_sniffer_class", lambda: UnbuildableAsyncSniffer
+    )
+
+    with pytest.raises(RuntimeError, match=FAILURE_MESSAGE):
+        build_pcap_sniffer()
+
+    assert [socket.closed for socket in opened] == [True]
+
+
+def test_stopping_the_pcap_sniffer_releases_the_socket(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_pcap_layer(monkeypatch)
+    sniffer = build_pcap_sniffer()
+    sniffer.start()
+
+    sniffer.stop()
+
+    assert sniffer._sniffer.stopped is True
+    assert sniffer._socket.closed is True
 
 
 # --------------------------------------------------------------------------

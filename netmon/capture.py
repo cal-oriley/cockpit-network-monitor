@@ -73,9 +73,7 @@ DROPPING_PACKETS_DETAIL = (
     "lost before they could be counted, so every rate shown here is "
     "undercounted. The driver reports {driver_dropped:,} of them discarded."
 )
-UNATTRIBUTED_DETAIL = (
-    "{count} packets arrived with no address that could be counted."
-)
+UNATTRIBUTED_DETAIL = "{count} packets could not be attributed to a device."
 NOT_RUNNING_DETAIL = (
     "Packet capture is not running. Restart this program to see live traffic."
 )
@@ -346,6 +344,10 @@ class CaptureSource:
             sniffer = self._sniffer_factory(
                 iface, bpf_filter, self._on_packet, self._started.set
             )
+            # Held before it is started: the sniffer owns an open libpcap
+            # handle from the moment it is built, and stop() is the only thing
+            # that can release it.
+            self._sniffer = sniffer
             sniffer.start()
         except NpcapMissingError as error:
             self._failure = CaptureStatus(CAPTURE_STATE_NPCAP_MISSING, str(error))
@@ -354,7 +356,6 @@ class CaptureSource:
             self._failure = _status_from_exception(error)
             return
 
-        self._sniffer = sniffer
         self._await_start(sniffer)
 
     def stop(self, timeout: float = STOP_TIMEOUT_S) -> None:
@@ -488,7 +489,7 @@ class _PcapSniffer:
         on_started: Callable[[], None],
     ) -> None:
         conf = _require_pcap()
-        from scapy.sendrecv import AsyncSniffer
+        sniffer_class = _async_sniffer_class()
 
         # promisc=False explicitly: conf.sniff_promisc defaults to True and the
         # socket falls back to it, which would put the adapter into promiscuous
@@ -497,7 +498,7 @@ class _PcapSniffer:
             iface=iface, filter=bpf_filter, promisc=False
         )
         try:
-            self._sniffer = AsyncSniffer(
+            self._sniffer = sniffer_class(
                 opened_socket=self._socket,
                 prn=on_packet,
                 store=False,
@@ -542,6 +543,16 @@ class _PcapSniffer:
     def drop_counts(self) -> tuple[int, int] | None:
         """``(received, dropped)`` from the capture driver, or ``None``.
 
+        Known constraint: this is called from the HTTP threads twice a second
+        against the same ``pcap_t`` the capture thread is reading from, and
+        libpcap handles are not documented as thread-safe. It is empirically
+        fine here, and the guard below turns a Python-level failure into
+        "unknown", but it could not catch a fault inside the C call. Locking is
+        deliberately not added: the callback's hot path is budgeted at a
+        counter increment and the capture saturates near 1,700 packets per
+        second, so a lock there would cost more packets than these counters
+        exist to notice.
+
         ponytail: reaches libpcap's ``pcap_stats`` through scapy's private
         socket internals, because scapy 2.7 exposes no statistics wrapper.
         Ceiling - both the ``pcap_fd.pcap`` attribute chain and the vendored
@@ -568,6 +579,24 @@ def _scapy_conf() -> Any:
     return conf
 
 
+def _async_sniffer_class() -> type:
+    """scapy's asynchronous sniffer class, imported lazily."""
+    from scapy.sendrecv import AsyncSniffer
+
+    return AsyncSniffer
+
+
+def _pcap_listen_socket_class() -> type:
+    """scapy's libpcap listen-socket class, imported lazily.
+
+    Its absence means scapy has no libpcap binding at all, which is one of the
+    two ways :func:`_require_pcap` recognises a missing Npcap.
+    """
+    from scapy.arch.libpcap import L2pcapListenSocket
+
+    return L2pcapListenSocket
+
+
 def _require_pcap() -> Any:
     """Return scapy's config, having confirmed it will capture via libpcap.
 
@@ -580,13 +609,13 @@ def _require_pcap() -> Any:
     """
     conf = _scapy_conf()
     try:
-        from scapy.arch.libpcap import L2pcapListenSocket
+        pcap_listen_socket = _pcap_listen_socket_class()
     except ImportError as error:
         raise NpcapMissingError(NPCAP_MISSING_DETAIL) from error
     listen_socket = conf.L2listen
     if not conf.use_pcap or not (
         isinstance(listen_socket, type)
-        and issubclass(listen_socket, L2pcapListenSocket)
+        and issubclass(listen_socket, pcap_listen_socket)
     ):
         raise NpcapMissingError(NPCAP_MISSING_DETAIL)
     return conf
