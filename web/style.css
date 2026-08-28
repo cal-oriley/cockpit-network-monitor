@@ -20,15 +20,21 @@
   --text-dim: #8a97a9;
   --text-faint: #5d6878;
   --accent: #4db8ff;
+  --accent-total: #b98bff;
   --ok: #46d17f;
   --warn: #ffb02e;
   --warn-bg: rgba(255, 176, 46, 0.1);
   --danger: #ff6b6b;
   --stale: #7c8899;
+  --total-border: rgba(185, 139, 255, 0.4);
+  --total-bg: #1d1e2f;
+  --total-bg-hover: #23243a;
 
   /* Canvas colours, read from here by app.js so the palette has one home */
   --graph-line: #4db8ff;
   --graph-fill: rgba(77, 184, 255, 0.16);
+  --graph-line-total: #b98bff;
+  --graph-fill-total: rgba(185, 139, 255, 0.18);
   --graph-line-stale: #7c8899;
   --graph-fill-stale: rgba(124, 136, 153, 0.08);
   --graph-baseline: rgba(228, 234, 242, 0.1);
@@ -285,7 +291,7 @@ body {
   min-width: 0;
 }
 
-.row-ip {
+.row-name {
   font-family: var(--font-mono);
   font-size: 0.88rem;
   letter-spacing: -0.01em;
@@ -332,6 +338,39 @@ body {
   display: block;
   width: 100%;
   height: 100%;
+}
+
+/* ── Total row ──────────────────────────────────────────────────────────── */
+
+/*
+ * The combined trace across every listed device. It is an ordinary card on the
+ * same grid, so its canvas lines up with the device canvases and the shared
+ * axis; everything else about it - the named label rather than an address, the
+ * violet accent, and the heavier line app.js draws from --graph-line-total -
+ * is there to stop it reading as one more device. The border stays 1px on
+ * every side, since a thicker edge would shrink the content box and pull the
+ * graph column out of line with the rows below.
+ */
+
+.row-total {
+  border-color: var(--total-border);
+  background: var(--total-bg);
+}
+
+.row-total:hover {
+  background: var(--total-bg-hover);
+}
+
+.row-total .row-name {
+  font-family: var(--font-ui);
+  font-size: 0.85rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--accent-total);
+}
+
+.row-total .row-rate {
+  color: var(--accent-total);
 }
 
 /* ── Shared time axis ───────────────────────────────────────────────────── */

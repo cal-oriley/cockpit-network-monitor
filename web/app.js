@@ -5,8 +5,9 @@
  * carries a complete, bucket-aligned series per device and the page simply
  * redraws it. Rows are reconciled by IP rather than rebuilt, so only the rows
  * that actually appear or leave touch the DOM and the rest never flicker or
- * reorder under the cursor. The watched subnet travels the other way, from the
- * header's field up to the server as `?subnet=`.
+ * reorder under the cursor. Heading them is the combined trace, summed here
+ * across whichever devices the payload listed. The watched subnet travels the
+ * other way, from the header's field up to the server as `?subnet=`.
  */
 (() => {
   'use strict';
@@ -51,6 +52,7 @@
 
   const GRAPH_TOP_PAD_PX = 4;
   const GRAPH_LINE_WIDTH_PX = 1;
+  const GRAPH_TOTAL_LINE_WIDTH_PX = 2;
   const MIN_Y_SCALE_PPS = 1;
 
   const TEXT = Object.freeze({
@@ -67,6 +69,9 @@
     axisSecondsAgo: (seconds) => `-${formatSeconds(seconds)}s`,
     graphLabel: (ip, pps) => `${ip}: ${formatRate(pps)} packets per second`,
     graphLabelStale: (ip) => `${ip}: no traffic`,
+    totalName: 'All devices',
+    totalGraphLabel: (pps) =>
+      `All devices combined: ${formatRate(pps)} packets per second`,
     captureFallback: (state) => `Packet capture unavailable (${state}).`,
     subnetRejected: 'The server rejected that subnet.',
     malformedPayload: 'Malformed /api/rates payload',
@@ -92,12 +97,28 @@
   /* Canvas colours live in style.css so the palette has a single home. */
   const PALETTE = readPalette();
 
+  /* How a card's trace is inked. The total gets its own accent and a heavier
+     line so a glance never mistakes it for one more device. */
+  const GRAPH_STYLE_DEVICE = Object.freeze({
+    line: PALETTE.line,
+    fill: PALETTE.fill,
+    lineWidth: GRAPH_LINE_WIDTH_PX,
+  });
+  const GRAPH_STYLE_TOTAL = Object.freeze({
+    line: PALETTE.totalLine,
+    fill: PALETTE.totalFill,
+    lineWidth: GRAPH_TOTAL_LINE_WIDTH_PX,
+  });
+
   // ── State ───────────────────────────────────────────────────────────────
 
   /** @type {Map<string, object>} IP to row view, in creation order. */
   const rowViews = new Map();
-  /** @type {WeakMap<Element, object>} Canvas to its row view, for resize redraws. */
+  /** @type {WeakMap<Element, object>} Canvas to its card view, for resize redraws. */
   const canvasOwners = new WeakMap();
+
+  /** @type {object|null} The combined-traffic card, present only while rows are. */
+  let totalView = null;
 
   let axisWindowMs = null;
   let connectionState = CONNECTION_CONNECTING;
@@ -129,6 +150,8 @@
     return Object.freeze({
       line: read('--graph-line'),
       fill: read('--graph-fill'),
+      totalLine: read('--graph-line-total'),
+      totalFill: read('--graph-fill-total'),
       staleLine: read('--graph-line-stale'),
       staleFill: read('--graph-fill-stale'),
       baseline: read('--graph-baseline'),
@@ -149,6 +172,34 @@
     if (!Array.isArray(values)) return [];
     const series = values.map((value) => Math.max(0, numberOr(value, 0)));
     return series.length === 1 ? [series[0], series[0]] : series;
+  }
+
+  /**
+   * Element-wise sum of the devices' `pps` arrays.
+   *
+   * Every array is the same fixed length and covers the same intervals, which
+   * is exactly what makes adding them position by position mean anything. A
+   * device carrying no array at all is skipped, and a short one is aligned to
+   * the newest end rather than the oldest, so an off-length array costs the
+   * oldest buckets instead of sliding that device's history sideways.
+   */
+  function sumSeries(devices) {
+    const arrays = [];
+    for (const device of devices) {
+      const values = device.pps;
+      if (Array.isArray(values) && values.length > 0) arrays.push(values);
+    }
+    if (arrays.length === 0) return [];
+
+    const length = arrays.reduce((widest, values) => Math.max(widest, values.length), 0);
+    const totals = new Array(length).fill(0);
+    for (const values of arrays) {
+      const offset = length - values.length;
+      for (let i = 0; i < values.length; i += 1) {
+        totals[offset + i] += Math.max(0, numberOr(values[i], 0));
+      }
+    }
+    return totals;
   }
 
   function drawGraph(view) {
@@ -196,7 +247,7 @@
     for (let i = 0; i < series.length; i += 1) ctx.lineTo(xAt(i), yAt(series[i]));
     ctx.lineTo(lastX, baselineY);
     ctx.closePath();
-    ctx.fillStyle = view.stale ? PALETTE.staleFill : PALETTE.fill;
+    ctx.fillStyle = view.stale ? PALETTE.staleFill : view.style.fill;
     ctx.fill();
 
     ctx.beginPath();
@@ -206,7 +257,8 @@
       if (i === 0) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
     }
-    ctx.strokeStyle = view.stale ? PALETTE.staleLine : PALETTE.line;
+    ctx.lineWidth = view.style.lineWidth;
+    ctx.strokeStyle = view.stale ? PALETTE.staleLine : view.style.line;
     ctx.stroke();
   }
 
@@ -382,18 +434,21 @@
 
   // ── Row reconciliation ──────────────────────────────────────────────────
 
-  function createRowView(ip) {
+  /**
+   * Build the card every graph shares: a label column carrying a name, the
+   * current rate and the window's peak, beside a canvas on the grid's graph
+   * column. The caller names it and adds whatever else it carries.
+   */
+  function createCardView(style) {
     const element = document.createElement('article');
     element.className = 'row grid-row';
-    element.dataset.ip = ip;
     element.dataset.stale = 'false';
 
     const label = document.createElement('div');
     label.className = 'row-label';
 
-    const ipEl = document.createElement('div');
-    ipEl.className = 'row-ip';
-    ipEl.textContent = ip;
+    const nameEl = document.createElement('div');
+    nameEl.className = 'row-name';
 
     const stats = document.createElement('div');
     stats.className = 'row-stats';
@@ -404,26 +459,56 @@
     const peakEl = document.createElement('span');
     peakEl.className = 'row-peak';
 
-    const badgeEl = document.createElement('span');
-    badgeEl.className = 'row-badge';
-    badgeEl.textContent = TEXT.noTraffic;
-
-    stats.append(rateEl, peakEl, badgeEl);
-    label.append(ipEl, stats);
+    stats.append(rateEl, peakEl);
+    label.append(nameEl, stats);
 
     const graph = document.createElement('div');
     graph.className = 'row-graph';
 
     const canvas = document.createElement('canvas');
     canvas.setAttribute('role', 'img');
-    canvas.setAttribute('aria-label', TEXT.graphLabel(ip, 0));
     graph.appendChild(canvas);
 
     element.append(label, graph);
 
-    const view = { ip, element, canvas, rateEl, peakEl, series: [], peakPps: 0, stale: false };
+    const view = {
+      element,
+      canvas,
+      nameEl,
+      stats,
+      rateEl,
+      peakEl,
+      style,
+      series: [],
+      peakPps: 0,
+      stale: false,
+    };
     canvasOwners.set(canvas, view);
     resizeObserver.observe(canvas);
+    return view;
+  }
+
+  function createRowView(ip) {
+    const view = createCardView(GRAPH_STYLE_DEVICE);
+    view.ip = ip;
+    view.element.dataset.ip = ip;
+    view.nameEl.textContent = ip;
+    view.canvas.setAttribute('aria-label', TEXT.graphLabel(ip, 0));
+
+    const badgeEl = document.createElement('span');
+    badgeEl.className = 'row-badge';
+    badgeEl.textContent = TEXT.noTraffic;
+    view.stats.appendChild(badgeEl);
+
+    return view;
+  }
+
+  /** Named rather than addressed, so it cannot be read as a device that exists. */
+  function createTotalView() {
+    const view = createCardView(GRAPH_STYLE_TOTAL);
+    view.element.classList.add('row-total');
+    view.nameEl.textContent = TEXT.totalName;
+    view.canvas.setAttribute('aria-label', TEXT.totalGraphLabel(0));
     return view;
   }
 
@@ -449,10 +534,54 @@
     drawGraph(view);
   }
 
-  function destroyRowView(view) {
+  /**
+   * Redraw the total from the devices the payload actually listed, so the sum
+   * covers the subnet in view rather than traffic filtered out of it, and
+   * autoscale it to its own peak like every other card.
+   *
+   * `idle_ms` is per device and has no aggregate, so this card never goes
+   * stale: everything falling quiet is already said by a trace scrolling flat
+   * along the baseline, which it keeps doing because this runs every poll.
+   */
+  function updateTotalView(view, devices) {
+    const currentPps = devices.reduce(
+      (total, device) => total + Math.max(0, numberOr(device.current_pps, 0)),
+      0,
+    );
+    view.series = normalizeSeries(sumSeries(devices));
+    view.peakPps = view.series.reduce((peak, value) => Math.max(peak, value), 0);
+
+    view.rateEl.textContent = TEXT.rate(currentPps);
+    view.peakEl.textContent = TEXT.peak(view.peakPps);
+    view.canvas.setAttribute('aria-label', TEXT.totalGraphLabel(currentPps));
+
+    drawGraph(view);
+  }
+
+  function destroyCardView(view) {
     resizeObserver.unobserve(view.canvas);
     canvasOwners.delete(view.canvas);
     view.element.remove();
+  }
+
+  /**
+   * Keep the total at the head of the grid for as long as anything is listed.
+   * Summing an empty list is not zero traffic but no data, which the waiting
+   * state already says, so the card leaves with the last row.
+   */
+  function reconcileTotal(devices) {
+    if (devices.length === 0) {
+      if (totalView !== null) {
+        destroyCardView(totalView);
+        totalView = null;
+      }
+      return;
+    }
+    if (totalView === null) {
+      totalView = createTotalView();
+      els.rows.prepend(totalView.element);
+    }
+    updateTotalView(totalView, devices);
   }
 
   /**
@@ -462,9 +591,13 @@
    * payload's numeric IP order. A device that falls outside the current subnet
    * simply stops being listed and leaves through this same path, taking only
    * its own canvas with it - the surviving rows keep theirs.
+   *
+   * The listed devices are also what the total is summed over, so it follows
+   * the same subnet the rows do, and the count returned for the header stays a
+   * count of devices.
    */
   function reconcileRows(devices) {
-    const orderedIps = [];
+    const listed = [];
     for (const device of devices) {
       if (!device || typeof device.ip !== 'string' || !device.ip) continue;
       let view = rowViews.get(device.ip);
@@ -474,24 +607,29 @@
         els.rows.appendChild(view.element);
       }
       updateRowView(view, device);
-      orderedIps.push(device.ip);
+      listed.push(device);
     }
 
-    const listed = new Set(orderedIps);
+    const listedIps = new Set(listed.map((device) => device.ip));
     for (const [ip, view] of rowViews) {
-      if (listed.has(ip)) continue;
-      destroyRowView(view);
+      if (listedIps.has(ip)) continue;
+      destroyCardView(view);
       rowViews.delete(ip);
     }
 
-    orderedIps.forEach((ip, index) => {
-      const view = rowViews.get(ip);
-      const occupant = els.rows.children[index];
+    reconcileTotal(listed);
+
+    /* The total holds the grid's first slot while it is shown, so the device
+       rows begin one position further in. */
+    const firstRowIndex = totalView === null ? 0 : 1;
+    listed.forEach((device, index) => {
+      const view = rowViews.get(device.ip);
+      const occupant = els.rows.children[firstRowIndex + index];
       if (occupant !== view.element) els.rows.insertBefore(view.element, occupant || null);
     });
 
     els.emptyState.hidden = rowViews.size > 0;
-    return orderedIps.length;
+    return listed.length;
   }
 
   // ── Polling ─────────────────────────────────────────────────────────────
