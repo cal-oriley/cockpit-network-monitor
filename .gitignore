@@ -42,3 +42,6 @@ desktop.ini
 
 # Logs
 *.log
+
+# Local commit scratchpad
+CHANGELOG.txt

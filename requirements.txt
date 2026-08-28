@@ -1,0 +1,5 @@
+# Phase 1 has no runtime dependencies: the app runs on the standard library
+# alone. scapy arrives in Phase 2 for real packet capture.
+#
+# Development / test only:
+pytest
