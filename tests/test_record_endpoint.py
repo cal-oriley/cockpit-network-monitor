@@ -8,17 +8,27 @@ told between one press of the button and the next.
 """
 
 import csv
+import http.client
+import json
 from http import HTTPStatus
 from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit
 
 import pytest
 
 from netmon.recorder import IDLE_STATUS
 from netmon.server import (
+    BODY_TOO_LARGE_ERROR,
+    CONNECTION_CLOSE,
+    CONTENT_LENGTH_HEADER,
     DEFAULT_SUBNET,
     JSON_CONTENT_TYPE,
     MAX_BODY_BYTES,
+    MAX_DRAIN_BYTES,
+    MISSING_LENGTH_ERROR,
     RATES_PATH,
+    RECORD_PATH,
     START_ACTION,
     STOP_ACTION,
 )
@@ -28,6 +38,7 @@ from .conftest import (
     DEFAULT_SUBNET_IPS,
     INVALID_SUBNETS,
     RECORDING_KEYS,
+    REQUEST_TIMEOUT_S,
     SECOND_SUBNET,
     FakeClock,
     fetch_rates,
@@ -41,7 +52,45 @@ from .conftest import (
 UNKNOWN_ACTION = "pause"
 MALFORMED_BODIES = [b"", b"not json at all", b"[1, 2, 3]", b'"start"', b"{"]
 
+# A byte count is a non-negative run of decimal digits and nothing else. The
+# superscript is the awkward one: it passes ``str.isdigit`` while ``int``
+# refuses it, so a laxer check would answer with Python's own complaint.
+NOT_A_LENGTH = ["as many as it takes", "-1", "\u00b2", "0x40", ""]
+# Far enough past the drain cap that no amount of headroom could cover it.
+ABSURD_LENGTH_MULTIPLE = 8
+
+TOO_LARGE_ERROR = BODY_TOO_LARGE_ERROR.format(limit=MAX_BODY_BYTES)
+
 STOP_BODY = {"action": STOP_ACTION}
+
+
+def refused_without_a_body(
+    base_url: str, declared: str
+) -> tuple[int, str | None, dict[str, Any]]:
+    """POST a ``Content-Length`` the server refuses, sending no body at all.
+
+    Withholding the body is what makes the refusal observable: a server that
+    waited for bytes it had already decided not to use would sit there until
+    the socket timed out instead of answering. Yields the status, the
+    ``Connection`` header, and the decoded payload.
+    """
+    url = urlsplit(base_url)
+    connection = http.client.HTTPConnection(
+        url.hostname, url.port, timeout=REQUEST_TIMEOUT_S
+    )
+    try:
+        connection.putrequest("POST", RECORD_PATH)
+        connection.putheader("Content-Type", JSON_CONTENT_TYPE)
+        connection.putheader(CONTENT_LENGTH_HEADER, declared)
+        connection.endheaders()
+        answer = connection.getresponse()
+        return (
+            answer.status,
+            answer.getheader("Connection"),
+            json.loads(answer.read()),
+        )
+    finally:
+        connection.close()
 
 
 def start_body(subnet: str = DEFAULT_SUBNET) -> dict[str, str]:
@@ -185,13 +234,43 @@ def test_a_body_that_is_not_a_json_object_is_rejected(
 
 
 def test_a_body_larger_than_a_record_request_is_refused(clock: FakeClock) -> None:
+    """The refusal has to reach a caller still mid-send, which is the whole
+    point of wording it: this body is over the limit but within the drain cap,
+    so it is read out of the socket before the answer is written."""
     oversized = b'{"action": "start", "subnet": "' + b"9" * MAX_BODY_BYTES + b'"}'
 
     with serving(populated_window(clock)) as base_url:
         response = post_record(base_url, raw=oversized)
 
     assert response.status == HTTPStatus.BAD_REQUEST
-    assert response.body["error"].endswith(".")
+    assert response.body["error"] == TOO_LARGE_ERROR
+
+
+def test_a_body_far_past_the_drain_cap_is_refused_unread(clock: FakeClock) -> None:
+    """Answered, not indulged: a body this size is never read, and the caller
+    is told the connection ends with the refusal rather than continuing."""
+    absurd = MAX_DRAIN_BYTES * ABSURD_LENGTH_MULTIPLE
+
+    with serving(populated_window(clock)) as base_url:
+        status, connection, body = refused_without_a_body(base_url, str(absurd))
+
+    assert status == HTTPStatus.BAD_REQUEST
+    assert body["error"] == TOO_LARGE_ERROR
+    assert connection == CONNECTION_CLOSE
+
+
+@pytest.mark.parametrize("declared", NOT_A_LENGTH)
+def test_a_body_of_undeclared_length_is_refused_with_the_connection(
+    clock: FakeClock, declared: str
+) -> None:
+    """With no byte count there is no reading the body out and no telling it
+    from whatever follows, so this connection cannot carry another request."""
+    with serving(populated_window(clock)) as base_url:
+        status, connection, body = refused_without_a_body(base_url, declared)
+
+    assert status == HTTPStatus.BAD_REQUEST
+    assert body["error"] == MISSING_LENGTH_ERROR
+    assert connection == CONNECTION_CLOSE
 
 
 @pytest.mark.parametrize("subnet", INVALID_SUBNETS)

@@ -53,6 +53,7 @@ RECORD_PATH = "/api/record"
 SUBNET_PARAM = "subnet"
 JSON_CONTENT_TYPE = "application/json"
 NO_STORE = "no-store"
+CONNECTION_CLOSE = "close"
 
 ACTION_KEY = "action"
 # The body names its subnet field after the query parameter it mirrors: a
@@ -64,6 +65,17 @@ CONTENT_LENGTH_HEADER = "Content-Length"
 # A record request is two short fields. Anything larger is not one, and the
 # body is read into memory before it can be judged.
 MAX_BODY_BYTES = 64 * 1024
+# An over-limit body is refused while the caller is still sending it, and a
+# socket closed with bytes still arriving in it is reset rather than finished:
+# that discards the response explaining the refusal, leaving the caller with a
+# connection error and no reason for it. Reading the refused body out first
+# lets the send finish so the answer can be read. The cap keeps that courtesy
+# from becoming a way to make the server read anything at all - past it the
+# body is refused unread and the connection ends, which is the right answer to
+# megabytes aimed at a two-field endpoint.
+MAX_DRAIN_BYTES = 4 * MAX_BODY_BYTES
+# Drained in pieces, so a refused body is never held in memory whole.
+DRAIN_CHUNK_BYTES = 8 * 1024
 
 SUBNET_ADVICE = f"Enter a subnet in CIDR form, such as {DEFAULT_SUBNET}."
 BIND_ADVICE = "Another server may already be running on this port."
@@ -215,6 +227,15 @@ def devices_in_subnet(
     return members
 
 
+class UnreadBodyError(ValueError):
+    """A request body refused without being read.
+
+    Distinguished from the other bad-request sentences because the rest of the
+    body is still arriving and nothing will consume it, so the response has to
+    say that the connection ends with it.
+    """
+
+
 class RatesRequestHandler(SimpleHTTPRequestHandler):
     """Serves the ``web/`` directory, intercepting the rates endpoint."""
 
@@ -298,6 +319,11 @@ class RatesRequestHandler(SimpleHTTPRequestHandler):
         """
         try:
             body = self._read_json_body()
+        except UnreadBodyError as error:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST, {"error": str(error)}, close=True
+            )
+            return
         except ValueError as error:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
             return
@@ -346,17 +372,20 @@ class RatesRequestHandler(SimpleHTTPRequestHandler):
         caller, the bytes are whatever they sent, and both are believed only as
         far as they can be checked.
         """
-        try:
-            length = int(self.headers.get(CONTENT_LENGTH_HEADER, 0))
-        except ValueError as error:
-            raise ValueError(MISSING_LENGTH_ERROR) from error
+        declared = self.headers.get(CONTENT_LENGTH_HEADER, "0").strip()
+        if not declared.isdecimal():
+            # Nothing states where this body ends, so there is no reading it
+            # out and no telling it from whatever follows on the connection.
+            raise UnreadBodyError(MISSING_LENGTH_ERROR)
+        length = int(declared)
         if length > MAX_BODY_BYTES:
-            # The unread remainder would otherwise be parsed as the next
-            # request on this connection.
-            self.close_connection = True
-            raise ValueError(BODY_TOO_LARGE_ERROR.format(limit=MAX_BODY_BYTES))
+            too_large = BODY_TOO_LARGE_ERROR.format(limit=MAX_BODY_BYTES)
+            if length > MAX_DRAIN_BYTES:
+                raise UnreadBodyError(too_large)
+            self._drain_body(length)
+            raise ValueError(too_large)
 
-        raw = self.rfile.read(max(0, length))
+        raw = self.rfile.read(length)
         try:
             body = json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError) as error:
@@ -365,7 +394,23 @@ class RatesRequestHandler(SimpleHTTPRequestHandler):
             raise ValueError(NOT_AN_OBJECT_ERROR)
         return body
 
-    def _send_json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
+    def _drain_body(self, length: int) -> None:
+        """Read a refused body out of the socket and discard it.
+
+        Pointless-looking work that is the whole reason the refusal arrives:
+        see ``MAX_DRAIN_BYTES`` for why an unread body costs the caller its
+        response.
+        """
+        remaining = length
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, DRAIN_CHUNK_BYTES))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+
+    def _send_json(
+        self, status: HTTPStatus, payload: dict[str, Any], close: bool = False
+    ) -> None:
         """Write ``payload`` as an uncacheable JSON response."""
         body = json.dumps(payload).encode("utf-8")
         try:
@@ -373,6 +418,10 @@ class RatesRequestHandler(SimpleHTTPRequestHandler):
             self.send_header("Content-Type", JSON_CONTENT_TYPE)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", NO_STORE)
+            if close:
+                # http.server derives ``close_connection`` from this header
+                # itself, so what is announced and what happens cannot drift.
+                self.send_header("Connection", CONNECTION_CLOSE)
             self.end_headers()
             self.wfile.write(body)
         except ConnectionError:
