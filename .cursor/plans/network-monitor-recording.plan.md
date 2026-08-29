@@ -79,6 +79,8 @@ timestamp_iso,epoch_ms,ip,pps
 - Present on **every** response, `active: false` when not recording — the page must never have to guess, and a missing key would read as "not recording" exactly when something had gone wrong. Idle values are null **except `rows`, which is `0`**: a null count would force the page to guard arithmetic for no benefit, whereas zero is both true and directly usable.
 - `subnet` is the subnet the recording is fixed to, which may differ from the payload's own `subnet` once the viewer changes what they are looking at. The page should show it when they differ, since that is precisely the confusing case.
 - `rows` is the count written so far — the cheapest honest proof that recording is working.
+- `file` is an **absolute** path, not the relative form the example above shows: the recordings directory resolves from the package location so it does not depend on the working directory, and the 500 case exists precisely to name a path the operator can act on. The page should therefore display the **filename**, not the whole path — a full path in a header sized for a small iframe is unreadable and would fight the fluid layout.
+- The **final row count lives in the `stop` response**, not in the poll that follows it. `stop` answers with the finished recording so the page can report how much was written, and by then the polled state is legitimately idle. A page that reads the tally from the next poll will report zero.
 - `detail` is null normally, and a human-readable sentence if the recording has a problem (disk error, dropped buckets). The page shows it verbatim, exactly as it already does for capture problems.
 
 ### Contract 2 — `POST /api/record`

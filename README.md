@@ -62,6 +62,7 @@ python -m netmon.server --port 8765
   `--host-ip`; needed only when that derivation picks the wrong adapter
 - `--mock` — feed the aggregator synthetic traffic instead of real packets
 - `--capture-status STATE` — force the reported capture state, to review the status banner
+- `--recordings-dir` — where recordings are written (default `recordings/`)
 
 ## Capture status
 
@@ -71,6 +72,24 @@ reported as a banner across the top of the page, naming what to check, with the
 device rows left readable. The server does not exit on a capture failure, and
 `--capture-status` forces a state so the banner can be reviewed without
 reproducing the condition.
+
+## Recording
+
+The page shows a rolling 10-second window and forgets everything older. To keep
+a longer record, press **record** in the header: every datapoint is appended to
+a timestamped CSV under `recordings/`, one row per device per 250 ms bucket.
+
+```csv
+timestamp_iso,epoch_ms,ip,pps
+2026-08-28T12:34:56.750-04:00,1787935496750,192.168.2.2,32.0
+```
+
+Recording happens on the machine running the monitor, not in the browser, so
+closing or reloading the page leaves it running — the button reports what the
+server is actually doing. A recording is fixed to the subnet selected when it
+started, so changing what you are looking at does not change what is written.
+Pressing record again stops it; pressing it once more starts a **new** file.
+Recording stops when the program exits.
 
 ## Tests
 
