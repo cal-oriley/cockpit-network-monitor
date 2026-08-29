@@ -6,6 +6,7 @@ a loopback port, fed by a fake-clocked window so nothing sleeps and no reading
 depends on real time.
 """
 
+import csv
 import json
 import socket
 import subprocess
@@ -37,6 +38,7 @@ from netmon.capture import (
 )
 from netmon.mock_source import MockSource
 from netmon.rate_window import RateWindow
+from netmon.recorder import IDLE_STATUS, Recorder, RecordingStatus
 from netmon.server import (
     BIND_ADVICE,
     CAPTURE_STATE_DETAILS,
@@ -45,11 +47,16 @@ from netmon.server import (
     DEFAULT_BIND_HOST,
     DEFAULT_HOST_IP,
     DEFAULT_PORT,
+    DEFAULT_RECORDINGS_DIR,
     DEFAULT_SUBNET,
     EXCLUSIVE_PORTS_AVAILABLE,
     JSON_CONTENT_TYPE,
+    MAX_BODY_BYTES,
     NO_STORE,
     RATES_PATH,
+    RECORD_PATH,
+    START_ACTION,
+    STOP_ACTION,
     SUBNET_PARAM,
     UNKNOWN_CAPTURE_DETAIL,
     CaptureStatusReader,
@@ -77,12 +84,23 @@ PAYLOAD_KEYS = {
     "host_ip",
     "subnet",
     "capture",
+    "recording",
     "bucket_ms",
     "buckets",
     "now_ms",
     "devices",
 }
 CAPTURE_KEYS = {"state", "detail"}
+RECORDING_KEYS = {"active", "file", "subnet", "rows", "started_ms", "detail"}
+
+# Nothing in these tests starts a recording unless it is handed a recorder of
+# its own, so this directory is never created.
+UNUSED_RECORDINGS_DIR = Path("recordings-no-test-writes-here")
+# Far longer than any test: a recorder under test is ticked by the assertions,
+# never by its own thread.
+IDLE_TICK_MS = 60 * 60 * 1000
+UNKNOWN_ACTION = "pause"
+MALFORMED_BODIES = [b"", b"not json at all", b"[1, 2, 3]", b'"start"', b"{"]
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -170,6 +188,25 @@ class StubHTTPServer:
         self.closed = True
 
 
+class StubRecorder:
+    """Stands in for the recorder so ``main``'s wiring can be observed."""
+
+    def __init__(
+        self, window: RateWindow, recordings_dir: Path, filter_devices: Any
+    ) -> None:
+        self.window = window
+        self.recordings_dir = recordings_dir
+        self.filter_devices = filter_devices
+        self.stopped = False
+
+    def status(self) -> RecordingStatus:
+        return IDLE_STATUS
+
+    def stop(self) -> RecordingStatus:
+        self.stopped = True
+        return IDLE_STATUS
+
+
 class RecordingSource:
     """Records how the server built it, and never opens a capture."""
 
@@ -220,6 +257,26 @@ def recording_sources(monkeypatch: pytest.MonkeyPatch) -> list[RecordingSource]:
     return created
 
 
+def stub_recorders(monkeypatch: pytest.MonkeyPatch) -> list[StubRecorder]:
+    """Replace the CSV recorder with stubs, returning the list."""
+    created: list[StubRecorder] = []
+
+    def build(**kwargs: Any) -> StubRecorder:
+        stub = StubRecorder(**kwargs)
+        created.append(stub)
+        return stub
+
+    monkeypatch.setattr(server, "Recorder", build)
+    return created
+
+
+def recorder_for(window: RateWindow, recordings_dir: Path) -> Recorder:
+    """A recorder wired exactly as the server wires its own."""
+    return Recorder(
+        window, recordings_dir, devices_in_subnet, tick_ms=IDLE_TICK_MS
+    )
+
+
 def populated_window(clock: FakeClock) -> RateWindow:
     """A window holding one completed bucket of traffic from both subnets."""
     window = RateWindow(bucket_ms=BUCKET_MS, buckets=WINDOW_BUCKETS, clock=clock)
@@ -236,8 +293,10 @@ def serving(
     read_capture_status: CaptureStatusReader | None = None,
     port: int = EPHEMERAL_PORT,
     server_class: type[ThreadingHTTPServer] = ThreadingHTTPServer,
+    recorder: Recorder | None = None,
 ) -> Iterator[str]:
     """Run the handler on a loopback port and yield its base URL."""
+    recorder = recorder or recorder_for(window, UNUSED_RECORDINGS_DIR)
     handler = partial(
         RatesRequestHandler,
         window=window,
@@ -245,6 +304,7 @@ def serving(
         read_capture_status=read_capture_status
         or partial(capture_status_for, CAPTURE_STATE_MOCK),
         default_subnet=parse_subnet(default_subnet),
+        recorder=recorder,
     )
     httpd = server_class((LOOPBACK, port), handler)
     httpd.daemon_threads = True
@@ -256,6 +316,7 @@ def serving(
         httpd.shutdown()
         httpd.server_close()
         thread.join(SHUTDOWN_TIMEOUT_S)
+        recorder.stop()
 
 
 def port_of(base_url: str) -> int:
@@ -285,6 +346,45 @@ def fetch_rates(base_url: str, subnet: str | None = None) -> Response:
             return _decode(error.status, error.headers, error.read())
 
 
+def post_record(
+    base_url: str, payload: Any = None, raw: bytes | None = None
+) -> Response:
+    """POST the record endpoint, decoding whatever it answers."""
+    body = raw if raw is not None else json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        f"{base_url}{RECORD_PATH}",
+        data=body,
+        method="POST",
+        headers={"Content-Type": JSON_CONTENT_TYPE},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_S) as answer:
+            return _decode(answer.status, answer.headers, answer.read())
+    except urllib.error.HTTPError as error:
+        with error:
+            return _decode(error.status, error.headers, error.read())
+
+
+def post_status(base_url: str, path: str) -> int:
+    """The status of a POST whose body is not expected to be JSON."""
+    request = urllib.request.Request(
+        f"{base_url}{path}", data=b"{}", method="POST"
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_S) as answer:
+            return answer.status
+    except urllib.error.HTTPError as error:
+        with error:
+            return error.status
+
+
+def start_body(subnet: str = DEFAULT_SUBNET) -> dict[str, str]:
+    return {"action": START_ACTION, "subnet": subnet}
+
+
+STOP_BODY = {"action": STOP_ACTION}
+
+
 def _decode(status: int, headers: Message, body: bytes) -> Response:
     return Response(
         status=status,
@@ -307,6 +407,13 @@ def fetch_index(base_url: str) -> tuple[int, str, str]:
 
 def served_ips(response: Response) -> list[str]:
     return [device["ip"] for device in response.body["devices"]]
+
+
+def recorded_ips(path: Path) -> set[str]:
+    """The addresses a recording actually holds rows for."""
+    with path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.reader(handle))
+    return {row[2] for row in rows[1:]}
 
 
 @pytest.mark.parametrize("state", sorted(CAPTURE_STATE_DETAILS))
@@ -449,6 +556,7 @@ def test_the_payload_carries_exactly_the_documented_keys(clock: FakeClock) -> No
 
     assert set(response.body) == PAYLOAD_KEYS
     assert set(response.body["capture"]) == CAPTURE_KEYS
+    assert set(response.body["recording"]) == RECORDING_KEYS
 
 
 def test_the_capture_status_is_read_again_for_every_poll(clock: FakeClock) -> None:
@@ -559,6 +667,185 @@ def test_two_pages_can_watch_different_subnets_at_once(clock: FakeClock) -> None
     assert served_ips(follow_up) == list(DEFAULT_SUBNET_IPS)
 
 
+def test_recording_is_reported_on_every_poll_even_when_idle(
+    clock: FakeClock,
+) -> None:
+    """A missing object would read as "not recording" when something broke."""
+    with serving(populated_window(clock)) as base_url:
+        first = fetch_rates(base_url)
+        second = fetch_rates(base_url)
+
+    assert first.body["recording"] == IDLE_STATUS.as_dict()
+    assert second.body["recording"] == IDLE_STATUS.as_dict()
+    assert first.body["recording"]["rows"] == 0
+
+
+def test_starting_a_recording_answers_with_the_recording_object(
+    clock: FakeClock, tmp_path: Path
+) -> None:
+    window = populated_window(clock)
+    recorder = recorder_for(window, tmp_path)
+
+    with serving(window, recorder=recorder) as base_url:
+        answer = post_record(base_url, start_body())
+        polled = fetch_rates(base_url)
+
+    assert answer.status == HTTPStatus.OK
+    assert answer.content_type == JSON_CONTENT_TYPE
+    assert set(answer.body) == RECORDING_KEYS
+    assert answer.body["active"] is True
+    assert answer.body["subnet"] == DEFAULT_SUBNET
+    assert answer.body["rows"] == 0
+    assert answer.body["detail"] is None
+    assert Path(answer.body["file"]).parent == tmp_path
+    assert polled.body["recording"] == answer.body
+
+
+def test_a_recording_ignores_the_subnet_the_page_moves_on_to(
+    clock: FakeClock, tmp_path: Path
+) -> None:
+    """The file keeps its own subnet; the payload reports both, so the page
+    can say they differ."""
+    window = populated_window(clock)
+    recorder = recorder_for(window, tmp_path)
+
+    with serving(window, recorder=recorder) as base_url:
+        started = post_record(base_url, start_body())
+        clock.advance(BUCKET_S)
+        recorder.tick()
+        elsewhere = fetch_rates(base_url, SECOND_SUBNET)
+        post_record(base_url, STOP_BODY)
+
+    assert elsewhere.body["subnet"] == SECOND_SUBNET
+    assert elsewhere.body["recording"]["subnet"] == DEFAULT_SUBNET
+    assert recorded_ips(Path(started.body["file"])) == set(DEFAULT_SUBNET_IPS)
+
+
+def test_a_second_start_is_refused_with_the_recording_already_running(
+    clock: FakeClock, tmp_path: Path
+) -> None:
+    """The loser of a two-tab race re-syncs rather than opening a new file."""
+    window = populated_window(clock)
+    recorder = recorder_for(window, tmp_path)
+
+    with serving(window, recorder=recorder) as base_url:
+        first = post_record(base_url, start_body())
+        second = post_record(base_url, start_body(SECOND_SUBNET))
+        post_record(base_url, STOP_BODY)
+
+    assert second.status == HTTPStatus.CONFLICT
+    assert second.body == first.body
+    assert second.body["subnet"] == DEFAULT_SUBNET
+    assert len(list(tmp_path.iterdir())) == 1
+
+
+def test_stopping_answers_with_the_final_tally(
+    clock: FakeClock, tmp_path: Path
+) -> None:
+    window = populated_window(clock)
+    recorder = recorder_for(window, tmp_path)
+
+    with serving(window, recorder=recorder) as base_url:
+        started = post_record(base_url, start_body())
+        clock.advance(BUCKET_S)
+        recorder.tick()
+        stopped = post_record(base_url, STOP_BODY)
+        after = fetch_rates(base_url)
+
+    assert stopped.status == HTTPStatus.OK
+    assert stopped.body["active"] is False
+    assert stopped.body["file"] == started.body["file"]
+    assert stopped.body["rows"] == len(DEFAULT_SUBNET_IPS)
+    assert after.body["recording"] == IDLE_STATUS.as_dict()
+
+
+@pytest.mark.parametrize("repeats", [1, 2])
+def test_a_stop_with_nothing_recording_is_not_an_error(
+    clock: FakeClock, repeats: int
+) -> None:
+    """The desired end state already holds; a second click is not a fault."""
+    with serving(populated_window(clock)) as base_url:
+        answers = [post_record(base_url, STOP_BODY) for _ in range(repeats)]
+
+    assert [answer.status for answer in answers] == [HTTPStatus.OK] * repeats
+    assert all(answer.body == IDLE_STATUS.as_dict() for answer in answers)
+
+
+@pytest.mark.parametrize("body", [{"action": UNKNOWN_ACTION}, {}, {"subnet": "x"}])
+def test_an_action_the_server_does_not_know_is_rejected(
+    clock: FakeClock, body: dict[str, str]
+) -> None:
+    with serving(populated_window(clock)) as base_url:
+        response = post_record(base_url, body)
+
+    assert response.status == HTTPStatus.BAD_REQUEST
+    assert response.content_type == JSON_CONTENT_TYPE
+    assert response.body["error"].endswith(".")
+    assert START_ACTION in response.body["error"]
+
+
+@pytest.mark.parametrize("raw", MALFORMED_BODIES)
+def test_a_body_that_is_not_a_json_object_is_rejected(
+    clock: FakeClock, raw: bytes
+) -> None:
+    with serving(populated_window(clock)) as base_url:
+        response = post_record(base_url, raw=raw)
+
+    assert response.status == HTTPStatus.BAD_REQUEST
+    assert response.body["error"].endswith(".")
+    assert "devices" not in response.body
+
+
+def test_a_body_larger_than_a_record_request_is_refused(clock: FakeClock) -> None:
+    oversized = b'{"action": "start", "subnet": "' + b"9" * MAX_BODY_BYTES + b'"}'
+
+    with serving(populated_window(clock)) as base_url:
+        response = post_record(base_url, raw=oversized)
+
+    assert response.status == HTTPStatus.BAD_REQUEST
+    assert response.body["error"].endswith(".")
+
+
+@pytest.mark.parametrize("subnet", INVALID_SUBNETS)
+def test_a_recording_of_an_unusable_subnet_is_refused(
+    clock: FakeClock, subnet: str, tmp_path: Path
+) -> None:
+    """Validated exactly as the query parameter is, and never opens a file."""
+    window = populated_window(clock)
+    recorder = recorder_for(window, tmp_path)
+
+    with serving(window, recorder=recorder) as base_url:
+        response = post_record(base_url, start_body(subnet))
+
+    assert response.status == HTTPStatus.BAD_REQUEST
+    assert "CIDR" in response.body["error"]
+    assert not list(tmp_path.iterdir())
+
+
+def test_a_recording_that_cannot_be_opened_answers_500_naming_the_path(
+    clock: FakeClock, tmp_path: Path
+) -> None:
+    """The one failure the operator can act on has to say where it happened."""
+    blocked = tmp_path / "in-the-way"
+    blocked.write_text("not a directory", encoding="utf-8")
+    window = populated_window(clock)
+
+    with serving(
+        window, recorder=recorder_for(window, blocked / "recordings")
+    ) as base_url:
+        response = post_record(base_url, start_body())
+        polled = fetch_rates(base_url)
+
+    assert response.status == HTTPStatus.INTERNAL_SERVER_ERROR
+    assert str(blocked) in response.body["error"]
+    assert polled.body["recording"] == IDLE_STATUS.as_dict()
+
+
+def test_a_post_to_any_other_path_is_not_found(clock: FakeClock) -> None:
+    with serving(populated_window(clock)) as base_url:
+        assert post_status(base_url, RATES_PATH) == HTTPStatus.NOT_FOUND
+
+
 def test_cli_defaults_match_the_documented_ones() -> None:
     args = build_parser().parse_args([])
 
@@ -569,6 +856,13 @@ def test_cli_defaults_match_the_documented_ones() -> None:
     assert args.iface is None
     assert args.mock is False
     assert args.capture_status is None
+    assert args.recordings_dir == DEFAULT_RECORDINGS_DIR
+
+
+def test_the_default_recordings_directory_sits_beside_the_program() -> None:
+    package_root = Path(server.__file__).resolve().parent
+
+    assert DEFAULT_RECORDINGS_DIR == package_root.parent / "recordings"
 
 
 def test_cli_accepts_an_invented_capture_state() -> None:
@@ -742,6 +1036,34 @@ def test_an_interrupted_run_shuts_the_source_down_cleanly(
     assert sources[0].started is True
     assert sources[0].stopped is True
     assert stub.closed is True
+
+
+def test_the_recordings_directory_comes_from_the_command_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    recording_sources(monkeypatch)
+    recorders = stub_recorders(monkeypatch)
+
+    code, stub = run_main(monkeypatch, ["--recordings-dir", str(tmp_path)])
+
+    assert code == 0
+    assert recorders[0].recordings_dir == tmp_path
+    # The endpoint's own filter, not a second implementation of it.
+    assert recorders[0].filter_devices is devices_in_subnet
+    assert stub.handler.keywords["recorder"] is recorders[0]
+
+
+def test_an_interrupted_run_closes_the_recording_as_well(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ctrl+C has to leave a flushed, closed CSV, not a half-written one."""
+    recording_sources(monkeypatch)
+    recorders = stub_recorders(monkeypatch)
+
+    code, _ = run_main(monkeypatch, [])
+
+    assert code == 0
+    assert recorders[0].stopped is True
 
 
 def test_an_interrupt_while_the_capture_opens_still_stops_it(

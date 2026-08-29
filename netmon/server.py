@@ -36,6 +36,12 @@ from .capture import (
 )
 from .mock_source import CAPTURE_STATE_MOCK, MOCK_DETAIL, MockSource
 from .rate_window import RateWindow
+from .recorder import (
+    AlreadyRecordingError,
+    IPNetwork,
+    Recorder,
+    RecordingStartError,
+)
 
 DEFAULT_PORT = 8080
 DEFAULT_BIND_HOST = "0.0.0.0"
@@ -43,12 +49,33 @@ DEFAULT_HOST_IP = "192.168.2.1"
 DEFAULT_SUBNET = "192.168.2.0/24"
 
 RATES_PATH = "/api/rates"
+RECORD_PATH = "/api/record"
 SUBNET_PARAM = "subnet"
 JSON_CONTENT_TYPE = "application/json"
 NO_STORE = "no-store"
 
+ACTION_KEY = "action"
+# The body names its subnet field after the query parameter it mirrors: a
+# subnet is validated the same way whichever way it arrives.
+SUBNET_KEY = SUBNET_PARAM
+START_ACTION = "start"
+STOP_ACTION = "stop"
+CONTENT_LENGTH_HEADER = "Content-Length"
+# A record request is two short fields. Anything larger is not one, and the
+# body is read into memory before it can be judged.
+MAX_BODY_BYTES = 64 * 1024
+
 SUBNET_ADVICE = f"Enter a subnet in CIDR form, such as {DEFAULT_SUBNET}."
 BIND_ADVICE = "Another server may already be running on this port."
+
+MISSING_LENGTH_ERROR = "The request needs a Content-Length header."
+BODY_TOO_LARGE_ERROR = "The request body is larger than {limit:,} bytes."
+INVALID_JSON_ERROR = "The request body is not valid JSON: {error}."
+NOT_AN_OBJECT_ERROR = "The request body must be a JSON object."
+UNKNOWN_ACTION_ERROR = (
+    "Unknown action {action!r}. Use {start!r} to begin a recording or "
+    "{stop!r} to end one."
+)
 
 # Windows and Unix disagree about what SO_REUSEADDR permits, and the difference
 # is the whole reason this is not just the stock server. On Unix it only lets a
@@ -61,8 +88,6 @@ BIND_ADVICE = "Another server may already be running on this port."
 # refuse that bind, and it does not stand in the way of an immediate restart.
 EXCLUSIVE_PORTS_AVAILABLE = hasattr(socket, "SO_EXCLUSIVEADDRUSE")
 
-IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
-
 # Both sources satisfy this, which is what lets the handler ask for the current
 # capture health while it builds each response instead of being handed a value
 # that was true only at startup.
@@ -72,6 +97,7 @@ PacketSource = CaptureSource | MockSource
 # Resolved from the package location so the server works from any working
 # directory - it is routinely launched from somewhere other than the repo root.
 WEB_DIRECTORY = Path(__file__).resolve().parent.parent / "web"
+DEFAULT_RECORDINGS_DIR = Path(__file__).resolve().parent.parent / "recordings"
 
 # Sentences for a state named on the command line, where none of the context a
 # real capture reports - the address, the platform, the driver's own message -
@@ -199,12 +225,14 @@ class RatesRequestHandler(SimpleHTTPRequestHandler):
         host_ip: str,
         read_capture_status: CaptureStatusReader,
         default_subnet: IPNetwork,
+        recorder: Recorder,
         **kwargs: Any,
     ) -> None:
         self._window = window
         self._host_ip = host_ip
         self._read_capture_status = read_capture_status
         self._default_subnet = default_subnet
+        self._recorder = recorder
         # The base class handles the whole request from within __init__, so
         # everything the handler needs must already be attached.
         super().__init__(*args, directory=str(WEB_DIRECTORY), **kwargs)
@@ -214,6 +242,12 @@ class RatesRequestHandler(SimpleHTTPRequestHandler):
             self._send_rates()
             return
         super().do_GET()
+
+    def do_POST(self) -> None:
+        if urlsplit(self.path).path == RECORD_PATH:
+            self._handle_record()
+            return
+        self.send_error(HTTPStatus.NOT_FOUND)
 
     def log_message(self, format: str, *args: Any) -> None:
         """Stay quiet: a 2 Hz poll would otherwise flood the console."""
@@ -248,9 +282,88 @@ class RatesRequestHandler(SimpleHTTPRequestHandler):
                 "host_ip": self._host_ip,
                 "subnet": str(network),
                 "capture": self._read_capture_status().as_dict(),
+                # Always present, even idle: a missing object would read as
+                # "not recording" at exactly the moment something went wrong.
+                "recording": self._recorder.status().as_dict(),
                 **snapshot,
             },
         )
+
+    def _handle_record(self) -> None:
+        """Start or stop the recording.
+
+        The handler never writes a row itself. It only flips the recorder,
+        which owns the file and the thread that fills it, so a slow disk cannot
+        stall the poll on the other end of this server.
+        """
+        try:
+            body = self._read_json_body()
+        except ValueError as error:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+
+        action = body.get(ACTION_KEY)
+        if action == STOP_ACTION:
+            self._send_json(HTTPStatus.OK, self._recorder.stop().as_dict())
+            return
+        if action != START_ACTION:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "error": UNKNOWN_ACTION_ERROR.format(
+                        action=action, start=START_ACTION, stop=STOP_ACTION
+                    )
+                },
+            )
+            return
+
+        requested = body.get(SUBNET_KEY)
+        try:
+            network = parse_subnet("" if requested is None else str(requested))
+        except ValueError as error:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+
+        try:
+            status = self._recorder.start(network)
+        except AlreadyRecordingError:
+            # The current recording, not an argument about it: two tabs are
+            # possible, and the loser should re-sync rather than quietly
+            # destroying the other's file by opening a new one.
+            self._send_json(HTTPStatus.CONFLICT, self._recorder.status().as_dict())
+            return
+        except RecordingStartError as error:
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(error)}
+            )
+            return
+        self._send_json(HTTPStatus.OK, status.as_dict())
+
+    def _read_json_body(self) -> dict[str, Any]:
+        """Decode the request body, or raise ``ValueError`` with a sentence.
+
+        Everything here is a trust boundary: the length is declared by the
+        caller, the bytes are whatever they sent, and both are believed only as
+        far as they can be checked.
+        """
+        try:
+            length = int(self.headers.get(CONTENT_LENGTH_HEADER, 0))
+        except ValueError as error:
+            raise ValueError(MISSING_LENGTH_ERROR) from error
+        if length > MAX_BODY_BYTES:
+            # The unread remainder would otherwise be parsed as the next
+            # request on this connection.
+            self.close_connection = True
+            raise ValueError(BODY_TOO_LARGE_ERROR.format(limit=MAX_BODY_BYTES))
+
+        raw = self.rfile.read(max(0, length))
+        try:
+            body = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise ValueError(INVALID_JSON_ERROR.format(error=error)) from error
+        if not isinstance(body, dict):
+            raise ValueError(NOT_AN_OBJECT_ERROR)
+        return body
 
     def _send_json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
         """Write ``payload`` as an uncacheable JSON response."""
@@ -327,6 +440,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--recordings-dir",
+        type=Path,
+        default=DEFAULT_RECORDINGS_DIR,
+        help=(
+            "Directory CSV recordings are written to, created if missing "
+            f"(default: {DEFAULT_RECORDINGS_DIR})"
+        ),
+    )
+    parser.add_argument(
         "--mock",
         action="store_true",
         help="Feed the aggregator synthetic traffic instead of real packets",
@@ -359,6 +481,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         window, mock=args.mock, host_ip=args.host_ip, iface=args.iface
     )
     read_capture_status = capture_status_reader(source.status, args.capture_status)
+    recorder = Recorder(
+        window=window,
+        recordings_dir=args.recordings_dir,
+        filter_devices=devices_in_subnet,
+    )
 
     handler = partial(
         RatesRequestHandler,
@@ -366,6 +493,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         host_ip=args.host_ip,
         read_capture_status=read_capture_status,
         default_subnet=default_subnet,
+        recorder=recorder,
     )
     try:
         server = ExclusivePortHTTPServer((args.host, args.port), handler)
@@ -397,6 +525,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         pass
     finally:
         server.server_close()
+        # The recording first, so a Ctrl+C leaves a flushed, closed CSV rather
+        # than one still waiting on the capture to wind down.
+        recorder.stop()
         source.stop()
     return 0
 

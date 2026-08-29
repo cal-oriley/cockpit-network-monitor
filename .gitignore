@@ -43,5 +43,8 @@ desktop.ini
 # Logs
 *.log
 
+# Recorded traffic
+recordings/
+
 # Local commit scratchpad
 CHANGELOG.txt
