@@ -20,11 +20,16 @@ let stoppedRecording = null;
 /** A start or stop in flight, which disables the button so a double-click
     cannot fire two starts. */
 let recordRequestInFlight = false;
+/** Whether a poll has been answered yet. Until one has, no subnet is known to
+    record - the viewed one arrives with the payload - so a press before then
+    would ask the server to record `null` and earn a 400. */
+let payloadSeen = false;
 /** Sentence from a refused start or stop, held until the next attempt. */
 let recordError = '';
 
 /** Adopt the recording the latest payload reports and render it. */
 export function applyRecordingStatus(recording) {
+  payloadSeen = true;
   recordingState = normalizeRecording(recording);
   renderRecording();
 }
@@ -52,7 +57,7 @@ function renderRecording() {
   const active = recordingState.active;
   els.recordLabel.textContent = active ? TEXT.record.active : TEXT.record.idle;
   els.record.setAttribute('aria-pressed', String(active));
-  els.record.disabled = recordRequestInFlight;
+  els.record.disabled = recordRequestInFlight || !payloadSeen;
 
   const reported = active ? recordingState : stoppedRecording;
   const rows = reported === null

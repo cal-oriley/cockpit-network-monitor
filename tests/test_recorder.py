@@ -15,9 +15,10 @@ import io
 import ipaddress
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from datetime import datetime
 from pathlib import Path
+from typing import Any, TextIO
 
 import pytest
 
@@ -28,6 +29,7 @@ from netmon.recorder import (
     IDLE_STATUS,
     THREAD_NAME,
     AlreadyRecordingError,
+    DeviceFilter,
     IPNetwork,
     Recorder,
     RecordingStartError,
@@ -58,6 +60,7 @@ OUTSIDE_IP = "10.11.12.2"
 IDLE_TICK_MS = 60 * 60 * 1000
 
 DISK_FULL = "No space left on device"
+FILTER_BROKEN = "the subnet filter raised"
 
 THREAD_TEST_BUCKET_MS = 20
 THREAD_TEST_DEADLINE_S = 3.0
@@ -77,6 +80,30 @@ class FailingFile(io.StringIO):
         raise self._error
 
 
+def raising_filter(error: BaseException) -> DeviceFilter:
+    """A subnet filter that fails, which an injected seam is free to do."""
+
+    def fail(
+        devices: Iterable[dict[str, Any]], network: IPNetwork
+    ) -> list[dict[str, Any]]:
+        raise error
+
+    return fail
+
+
+def tracked_files(monkeypatch: pytest.MonkeyPatch) -> list[TextIO]:
+    """Collect every file the recorder opens, so a close can be asserted."""
+    opened: list[TextIO] = []
+
+    def track(path: Path) -> TextIO:
+        file = open_recording(path)
+        opened.append(file)
+        return file
+
+    monkeypatch.setattr(recorder_module, "open_recording", track)
+    return opened
+
+
 @pytest.fixture
 def build(clock: FakeClock, tmp_path: Path) -> Iterator[RecorderFactory]:
     """Build recorders, stopping each of them when the test ends."""
@@ -88,13 +115,14 @@ def build(clock: FakeClock, tmp_path: Path) -> Iterator[RecorderFactory]:
         tick_ms: int = IDLE_TICK_MS,
         recordings_dir: Path | None = None,
         source_clock: Clock | None = None,
+        filter_devices: DeviceFilter = devices_in_subnet,
     ) -> tuple[RateWindow, Recorder]:
         ticker = clock if source_clock is None else source_clock
         window = RateWindow(bucket_ms=bucket_ms, buckets=buckets, clock=ticker)
         recorder = Recorder(
             window,
             tmp_path if recordings_dir is None else recordings_dir,
-            devices_in_subnet,
+            filter_devices,
             tick_ms=tick_ms,
             clock=ticker,
         )
@@ -625,12 +653,13 @@ def test_a_directory_that_cannot_be_created_answers_at_the_start(
     """A disk failure has to reach the request that caused it."""
     blocked = tmp_path / "in-the-way"
     blocked.write_text("not a directory", encoding="utf-8")
-    _, recorder = build(recordings_dir=blocked / "recordings")
+    recordings_dir = blocked / "recordings"
+    _, recorder = build(recordings_dir=recordings_dir)
 
     with pytest.raises(RecordingStartError) as error_info:
         recorder.start(SUBNET)
 
-    assert str(blocked) in str(error_info.value)
+    assert str(recordings_dir) in str(error_info.value)
     assert recorder.status() == IDLE_STATUS
     assert recorder.running is False
 
@@ -665,6 +694,49 @@ def test_a_write_failure_stops_the_recording_and_names_the_path(
     assert str(path) in status.detail
     assert DISK_FULL in status.detail
     assert recorder.stop().detail == status.detail
+
+
+def test_a_failure_before_the_write_stops_the_recording_just_the_same(
+    build: RecorderFactory, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Everything a tick does is guarded, not only the write at the end of it.
+
+    The subnet filter is handed in rather than imported, and an injected seam
+    is exactly the collaborator that starts raising one day. Letting it escape
+    would kill the writing thread while ``status`` went on reporting an active
+    recording with a row count that never moved again.
+    """
+    opened = tracked_files(monkeypatch)
+    window, recorder = build(
+        filter_devices=raising_filter(RuntimeError(FILTER_BROKEN))
+    )
+    path, _ = start_recording(recorder)
+    feed(window, *SUBNET_IPS)
+    advance(clock)
+
+    recorder.tick()
+
+    status = recorder.status()
+    assert status.active is False
+    assert status.detail is not None
+    assert FILTER_BROKEN in status.detail
+    assert str(path) in status.detail
+    assert opened[0].closed is True
+    assert data_rows(path) == []
+    assert recorder.stop().detail == status.detail
+
+
+def test_an_interrupt_during_a_tick_is_not_swallowed(
+    build: RecorderFactory, clock: FakeClock
+) -> None:
+    """Ctrl+C ends the program, so the tick's guard must let it past."""
+    window, recorder = build(filter_devices=raising_filter(KeyboardInterrupt()))
+    start_recording(recorder)
+    feed(window, *SUBNET_IPS)
+    advance(clock)
+
+    with pytest.raises(KeyboardInterrupt):
+        recorder.tick()
 
 
 def test_a_failed_recording_can_be_started_again(

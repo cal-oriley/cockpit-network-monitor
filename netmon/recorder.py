@@ -61,6 +61,7 @@ THREAD_NAME = "netmon-recorder"
 STOP_TIMEOUT_S = 2.0
 
 ALREADY_RECORDING = "A recording is already running; stop it before starting another."
+DIRECTORY_FAILED_DETAIL = "Cannot use {path} as the recordings directory ({error})."
 OPEN_FAILED_DETAIL = "Cannot write the recording to {path} ({error})."
 WRITE_FAILED_DETAIL = "Recording stopped: {path} could not be written ({error})."
 LOST_BUCKETS_DETAIL = (
@@ -280,10 +281,22 @@ class Recorder:
 
             snapshot = self._window.snapshot()
             started_ms = int(snapshot["now_ms"])
-            path = self._recordings_dir / recording_filename(started_ms, str(network))
             try:
                 self._recordings_dir.mkdir(parents=True, exist_ok=True)
-                path = unique_recording_path(self._recordings_dir, path.name)
+            except OSError as error:
+                # Named separately from the file itself: the operating system
+                # describes a directory it cannot create in terms of files,
+                # which only makes sense beside the directory's own path.
+                raise RecordingStartError(
+                    DIRECTORY_FAILED_DETAIL.format(
+                        path=self._recordings_dir, error=error
+                    )
+                ) from error
+
+            filename = recording_filename(started_ms, str(network))
+            path = self._recordings_dir / filename
+            try:
+                path = unique_recording_path(self._recordings_dir, filename)
                 file = open_recording(path)
             except OSError as error:
                 raise RecordingStartError(
@@ -337,42 +350,53 @@ class Recorder:
     def tick(self) -> None:
         """Write every bucket that has completed since the last tick.
 
-        Never raises: this runs on the writing thread, where an escaping
-        exception would end the recording silently and leave the page still
-        showing that it is recording.
+        Lets nothing but a Ctrl+C out: this runs on the writing thread, where
+        an escaping exception would end the recording silently and leave the
+        page still showing that it is recording. Whatever goes wrong anywhere
+        in the tick stops the recording and says so instead.
         """
         with self._control:
             session = self._session
             if session is None:
                 return
-
-            snapshot = self._window.snapshot()
-            now_ms = int(snapshot["now_ms"])
-            bucket_ms = int(snapshot["bucket_ms"])
-            ends_ms, lost = buckets_since(
-                session.last_end_ms, now_ms, bucket_ms, int(snapshot["buckets"])
-            )
-            devices = self._filter_devices(snapshot["devices"], session.network)
-            rows = _rows_for(devices, ends_ms, now_ms, bucket_ms)
-
             try:
-                session.writer.writerows(rows)
-                # Every tick, so a kill loses at most one bucket rather than
-                # whatever the operating system was still holding.
-                session.file.flush()
+                self._write_completed_buckets(session)
             except Exception as error:
-                # Broad on purpose, and the reason is the same one that makes
-                # the capture callback incapable of raising: an exception
-                # escaping here kills this thread, and a recording whose writer
-                # is dead while the page still says "recording" is the worst
-                # available outcome. Whatever went wrong becomes a sentence.
+                # Broad on purpose, and around the whole tick rather than the
+                # write alone: the reason is the same one that makes the
+                # capture callback incapable of raising. An exception escaping
+                # here kills this thread, and a recording whose writer is dead
+                # while the page still says "recording" is the worst available
+                # outcome. Everything the tick touches can fail - the subnet
+                # filter most plausibly, since it is handed in from outside.
+                # BaseException is deliberately not caught, so a Ctrl+C still
+                # ends the program rather than being reported as a fault.
                 self._fail(session, error)
-                return
 
-            session.rows += len(rows)
-            session.lost_buckets += lost
-            session.last_end_ms = max(session.last_end_ms, now_ms)
-            self._status = _status_for(session, active=True)
+    def _write_completed_buckets(self, session: _Session) -> None:
+        """Append the buckets ``session`` has not written yet, and count them.
+
+        Called holding the control lock, from the guard in :meth:`tick` that
+        turns anything going wrong here into a stopped recording.
+        """
+        snapshot = self._window.snapshot()
+        now_ms = int(snapshot["now_ms"])
+        bucket_ms = int(snapshot["bucket_ms"])
+        ends_ms, lost = buckets_since(
+            session.last_end_ms, now_ms, bucket_ms, int(snapshot["buckets"])
+        )
+        devices = self._filter_devices(snapshot["devices"], session.network)
+        rows = _rows_for(devices, ends_ms, now_ms, bucket_ms)
+
+        session.writer.writerows(rows)
+        # Every tick, so a kill loses at most one bucket rather than whatever
+        # the operating system was still holding.
+        session.file.flush()
+
+        session.rows += len(rows)
+        session.lost_buckets += lost
+        session.last_end_ms = max(session.last_end_ms, now_ms)
+        self._status = _status_for(session, active=True)
 
     def _run(self, session: _Session) -> None:
         """Tick at bucket resolution until stopped, without accumulating drift.
@@ -396,7 +420,7 @@ class Recorder:
             self._thread = None
 
     def _fail(self, session: _Session, error: Exception) -> None:
-        """Abandon a recording whose file will not take any more rows.
+        """Abandon a recording that will take no more rows.
 
         Carrying on would leave the page reporting a recording that is no
         longer being written, which is the one thing worse than stopping: the
