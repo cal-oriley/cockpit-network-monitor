@@ -27,19 +27,29 @@
       <span class="connection-dot" aria-hidden="true"></span>
       <span id="connection-label">connecting</span>
     </span>
+    <button class="record-button" id="record" type="button" aria-pressed="false"
+            aria-describedby="record-status">
+      <span class="record-dot" aria-hidden="true"></span>
+      <span id="record-label">Record</span>
+    </button>
   </div>
 </header>
 
 <p class="banner" id="banner" role="status" hidden></p>
 
-<div class="scroll">
-  <p class="empty" id="empty-state">Waiting for traffic&hellip;</p>
-  <main class="rows" id="rows"></main>
-  <footer class="axis-row grid-row">
-    <div class="axis-gutter"></div>
-    <div class="axis" id="axis"></div>
-  </footer>
+<div class="record-status" id="record-status" hidden>
+  <span class="record-state" id="record-state" role="status"></span>
+  <span class="record-file" id="record-file"></span>
+  <span class="record-rows" id="record-rows"></span>
+  <span class="record-note" id="record-note" role="status" hidden></span>
 </div>
+
+<p class="empty" id="empty-state">Waiting for traffic&hellip;</p>
+<main class="rows" id="rows"></main>
+<footer class="axis-row grid-row">
+  <div class="axis-gutter"></div>
+  <div class="axis" id="axis"></div>
+</footer>
 
 <script src="app.js"></script>
 </body>

@@ -6,8 +6,13 @@
  * redraws it. Rows are reconciled by IP rather than rebuilt, so only the rows
  * that actually appear or leave touch the DOM and the rest never flicker or
  * reorder under the cursor. Heading them is the combined trace, summed here
- * across whichever devices the payload listed. The watched subnet travels the
- * other way, from the header's field up to the server as `?subnet=`.
+ * across whichever devices the payload listed.
+ *
+ * Two things travel the other way, from the header up to the server: the
+ * watched subnet as `?subnet=`, and the record button as `POST /api/record`.
+ * Recording is the server's own business, so the button sends an action and
+ * then renders whatever the next poll says is happening rather than what it
+ * asked for.
  */
 (() => {
   'use strict';
@@ -17,6 +22,7 @@
   /* Relative so the panel keeps working if it is ever served under a path
      prefix rather than at the site root. */
   const RATES_URL = 'api/rates';
+  const RECORD_URL = 'api/record';
 
   const POLL_INTERVAL_MS = 500;
   const IMMEDIATE_POLL_MS = 0;
@@ -29,6 +35,28 @@
   /* A rejected subnet is answered with 400, which means the server is alive and
      disagreeing with the input - not a lost connection. */
   const HTTP_BAD_REQUEST = 400;
+
+  /* A start that lost the race to another tab. The response carries the
+     recording that won, so it is a state to adopt rather than a failure. */
+  const HTTP_CONFLICT = 409;
+
+  const JSON_CONTENT_TYPE = 'application/json';
+  const RECORD_ACTION_START = 'start';
+  const RECORD_ACTION_STOP = 'stop';
+
+  /* What the page holds before the first poll answers. The idle contract
+     reports nulls beside a zero row count; these are the same absences in the
+     types the page renders. */
+  const RECORDING_IDLE = Object.freeze({
+    active: false,
+    file: '',
+    subnet: '',
+    rows: 0,
+    detail: '',
+  });
+
+  /* Both, because the server reports a native absolute path. */
+  const PATH_SEPARATORS = /[\\/]/;
 
   const SUBNET_QUERY_PARAM = 'subnet';
   const SUBNET_STORAGE_KEY = 'netmon.subnet';
@@ -47,8 +75,18 @@
   const CONNECTION_LIVE = 'live';
   const CONNECTION_DISCONNECTED = 'disconnected';
 
-  /* Axis ticks as fractions across the graph column: oldest, midpoint, now. */
-  const AXIS_TICK_FRACTIONS = [0, 0.5, 1];
+  /* Axis ticks as fractions across the graph column, widest set first: oldest,
+     midpoint, now. Each set keeps `now`, so the label that survives thinning is
+     the one every trace is read from. */
+  const AXIS_TICK_SETS = Object.freeze([
+    Object.freeze([0, 0.5, 1]),
+    Object.freeze([0, 1]),
+    Object.freeze([1]),
+  ]);
+
+  /* Clear space wanted between neighbouring axis labels before they read as
+     one run of characters. */
+  const AXIS_TICK_GAP_PX = 8;
 
   const GRAPH_TOP_PAD_PX = 4;
   const GRAPH_LINE_WIDTH_PX = 1;
@@ -60,6 +98,17 @@
       [CONNECTION_CONNECTING]: 'connecting',
       [CONNECTION_LIVE]: 'live',
       [CONNECTION_DISCONNECTED]: 'disconnected',
+    }),
+    record: Object.freeze({
+      idle: 'Record',
+      active: 'Stop recording',
+      live: 'recording',
+      stopped: 'stopped',
+      rows: (rows) => `${rows} ${rows === 1 ? 'row' : 'rows'}`,
+      rowsWritten: (rows) => `wrote ${rows} ${rows === 1 ? 'row' : 'rows'}`,
+      mismatch: (subnet) => `Recording ${subnet}, not the subnet shown here.`,
+      refused: 'The server refused that recording request.',
+      unreachable: 'Could not reach the server to change recording.',
     }),
     deviceCount: (count) => `${count} ${count === 1 ? 'device' : 'devices'}`,
     rate: (pps) => `${formatRate(pps)} pps`,
@@ -88,6 +137,13 @@
     mockTag: document.getElementById('mock-tag'),
     connection: document.getElementById('connection'),
     connectionLabel: document.getElementById('connection-label'),
+    record: document.getElementById('record'),
+    recordLabel: document.getElementById('record-label'),
+    recordStatus: document.getElementById('record-status'),
+    recordState: document.getElementById('record-state'),
+    recordFile: document.getElementById('record-file'),
+    recordRows: document.getElementById('record-rows'),
+    recordNote: document.getElementById('record-note'),
     banner: document.getElementById('banner'),
     emptyState: document.getElementById('empty-state'),
     rows: document.getElementById('rows'),
@@ -121,12 +177,29 @@
   let totalView = null;
 
   let axisWindowMs = null;
+  /** @type {readonly number[]|null} The tick set currently laid out. */
+  let axisFractions = null;
   let connectionState = CONNECTION_CONNECTING;
   let nextDelayMs = POLL_INTERVAL_MS;
   let pollTimer = null;
 
   /** Subnet sent as `?subnet=`; `null` leaves the choice to the server. */
   let requestedSubnet = loadStoredSubnet();
+
+  /** Subnet the last readable payload was filtered to, so a recording of some
+      other subnet can be spotted and said out loud. */
+  let viewedSubnet = null;
+
+  /** The server's own account of what it is recording - never a local guess. */
+  let recordingState = RECORDING_IDLE;
+  /** The recording a stop just finished, whose tally only that response carries;
+      held until the next attempt, since the poll after it is rightly idle. */
+  let stoppedRecording = null;
+  /** A start or stop in flight, which disables the button so a double-click
+      cannot fire two starts. */
+  let recordRequestInFlight = false;
+  /** Sentence from a refused start or stop, held until the next attempt. */
+  let recordError = '';
 
   // ── Formatting ──────────────────────────────────────────────────────────
 
@@ -142,6 +215,19 @@
 
   function formatSeconds(seconds) {
     return Number.isInteger(seconds) ? String(seconds) : seconds.toFixed(1);
+  }
+
+  /**
+   * The name at the end of a path.
+   *
+   * Recordings are reported by absolute path, since where they land must not
+   * depend on anyone's working directory, but only the name is shown: a full
+   * path is far wider than the panel this page has to survive being squeezed
+   * into, and the directory is the same for every recording anyway.
+   */
+  function fileName(path) {
+    const parts = String(path).split(PATH_SEPARATORS);
+    return parts[parts.length - 1];
   }
 
   function readPalette() {
@@ -262,26 +348,76 @@
     ctx.stroke();
   }
 
+  /**
+   * Redraw whatever changed size. The canvases need it because their backing
+   * store is sized in device pixels; the axis needs it because how many labels
+   * fit is a question about width, and the two share an observer so a resize
+   * moves the traces and the times they are read against together.
+   */
   const resizeObserver = new ResizeObserver((entries) => {
     for (const entry of entries) {
+      if (entry.target === els.axis) {
+        layOutAxis();
+        continue;
+      }
       const view = canvasOwners.get(entry.target);
       if (view) drawGraph(view);
     }
   });
 
+  resizeObserver.observe(els.axis);
+
   // ── Shared time axis ────────────────────────────────────────────────────
 
   /**
-   * Build the axis once per window duration, derived from the payload's
-   * `bucket_ms * buckets` rather than hardcoded.
+   * Adopt a window duration, derived from the payload's `bucket_ms * buckets`
+   * rather than hardcoded, and lay the axis out for it.
    */
   function renderAxis(windowMs) {
     if (windowMs === null || windowMs === axisWindowMs) return;
     axisWindowMs = windowMs;
-    const windowSeconds = windowMs / MS_PER_SECOND;
+    axisFractions = null;
+    layOutAxis();
+  }
+
+  /**
+   * Lay out as many ticks as the graph column has room for.
+   *
+   * How wide a label is comes from measuring one rather than from assumptions
+   * about the font: the labels are monospace, so one rendered label gives a
+   * character width, and the widest label the window will produce is the oldest
+   * one. That keeps the threshold correct as the type scales with the panel,
+   * with nothing about the stylesheet's own sizes restated here.
+   */
+  function layOutAxis() {
+    if (axisWindowMs === null) return;
+    const windowSeconds = axisWindowMs / MS_PER_SECOND;
+    if (axisFractions === null) renderAxisTicks(AXIS_TICK_SETS[0], windowSeconds);
+
+    const charWidth = measureAxisCharWidth();
+    const available = els.axis.clientWidth;
+    /* No box yet, or no label to measure: the ResizeObserver runs this again as
+       soon as there is one. */
+    if (charWidth <= 0 || available <= 0) return;
+
+    const perTick = TEXT.axisSecondsAgo(windowSeconds).length * charWidth + AXIS_TICK_GAP_PX;
+    const fits = Math.max(1, Math.floor(available / perTick));
+    const chosen = AXIS_TICK_SETS.find((set) => set.length <= fits) ?? AXIS_TICK_SETS.at(-1);
+    if (chosen !== axisFractions) renderAxisTicks(chosen, windowSeconds);
+  }
+
+  function renderAxisTicks(fractions, windowSeconds) {
+    axisFractions = fractions;
     els.axis.replaceChildren(
-      ...AXIS_TICK_FRACTIONS.map((fraction) => buildAxisTick(fraction, windowSeconds)),
+      ...fractions.map((fraction) => buildAxisTick(fraction, windowSeconds)),
     );
+  }
+
+  /** Width of one monospace character in a rendered tick label. */
+  function measureAxisCharWidth() {
+    const label = els.axis.querySelector('.axis-tick-label');
+    const characters = label === null ? 0 : label.textContent.length;
+    return characters > 0 ? label.offsetWidth / characters : 0;
   }
 
   function buildAxisTick(fraction, windowSeconds) {
@@ -387,6 +523,7 @@
    */
   function acceptSubnet(subnet) {
     if (typeof subnet !== 'string' || !subnet) return;
+    viewedSubnet = subnet;
     if (document.activeElement !== els.subnet) els.subnet.value = subnet;
     if (requestedSubnet === null) return;
     requestedSubnet = subnet;
@@ -430,6 +567,162 @@
          back into it, since acceptSubnet holds off while it is focused. */
       if (event.key === 'Enter') els.subnet.blur();
     });
+  }
+
+  // ── Record control ──────────────────────────────────────────────────────
+
+  /*
+   * Recording happens on the server, so the button is only a control: every
+   * poll re-reads what the server says it is doing and the page renders that.
+   * Nothing here remembers having pressed the button, which is what makes a
+   * reload, a second tab, and a recording someone else started all read
+   * correctly - and what makes a 409 nothing to argue with.
+   */
+
+  /**
+   * Read the contract's `recording` object into the shapes the page renders.
+   *
+   * A payload with no `recording` at all - which is what a server too old to
+   * record looks like - reads as not recording, exactly as a missing `capture`
+   * reads as `ok`. An idle status is read out in full rather than discarded,
+   * because a recording that ended in failure keeps its reason there.
+   */
+  function normalizeRecording(recording) {
+    const status = recording && typeof recording === 'object' ? recording : {};
+    return {
+      active: status.active === true,
+      file: typeof status.file === 'string' ? status.file : '',
+      subnet: typeof status.subnet === 'string' ? status.subnet : '',
+      rows: Math.max(0, Math.round(numberOr(status.rows, 0))),
+      detail: typeof status.detail === 'string' ? status.detail.trim() : '',
+    };
+  }
+
+  /** Write a span's text, hiding it when empty so its gap in the row goes too. */
+  function setStatusText(element, text) {
+    if (element.textContent !== text) element.textContent = text;
+    element.hidden = text === '';
+  }
+
+  /**
+   * Render the button and the strip beneath the header.
+   *
+   * The strip carries the file and the row count, which is the cheapest proof a
+   * recording is working, and a note for the things worth saying out loud: a
+   * recording fixed to a subnet other than the one on screen, whatever `detail`
+   * the server reports verbatim, and a request the server refused.
+   *
+   * A running recording is described by the poll. A finished one is described
+   * by the stop response that reported it, because the poll half a second
+   * later is legitimately idle with nothing left to count - reading the tally
+   * from there would show zero every time.
+   */
+  function renderRecording() {
+    const active = recordingState.active;
+    els.recordLabel.textContent = active ? TEXT.record.active : TEXT.record.idle;
+    els.record.setAttribute('aria-pressed', String(active));
+    els.record.disabled = recordRequestInFlight;
+
+    const reported = active ? recordingState : stoppedRecording;
+    const rows = reported === null
+      ? ''
+      : active
+        ? TEXT.record.rows(reported.rows)
+        : TEXT.record.rowsWritten(reported.rows);
+
+    const notes = [];
+    if (active && recordingState.subnet && viewedSubnet
+        && recordingState.subnet !== viewedSubnet) {
+      notes.push(TEXT.record.mismatch(recordingState.subnet));
+    }
+    /* Shown when idle too: a recording that stopped because something went
+       wrong keeps its reason, and that is the moment it must not vanish. */
+    if (recordingState.detail) notes.push(recordingState.detail);
+    if (recordError) notes.push(recordError);
+    const note = notes.join(' ');
+
+    els.recordStatus.dataset.active = String(active);
+    setStatusText(
+      els.recordState,
+      active ? TEXT.record.live : reported === null ? '' : TEXT.record.stopped,
+    );
+    setStatusText(els.recordFile, reported === null ? '' : fileName(reported.file));
+    els.recordFile.title = reported === null ? '' : reported.file;
+    setStatusText(els.recordRows, rows);
+    setStatusText(els.recordNote, note);
+    els.recordStatus.hidden = reported === null && note === '';
+  }
+
+  /**
+   * @returns {Promise<{recording: object}|{error: string}>} A 409 is read as a
+   * recording rather than an error, since its body is the recording that won
+   * the race. Anything else the server refuses arrives as a sentence.
+   */
+  async function postRecord(body) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    try {
+      const response = await fetch(RECORD_URL, {
+        method: 'POST',
+        cache: 'no-store',
+        headers: { 'Content-Type': JSON_CONTENT_TYPE },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      if (!response.ok && response.status !== HTTP_CONFLICT) {
+        return { error: await readErrorSentence(response, TEXT.record.refused) };
+      }
+      return { recording: normalizeRecording(await response.json()) };
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  /**
+   * Start or stop recording, whichever the last reported state calls for, and
+   * adopt whatever the server reports back.
+   *
+   * A start is fixed to the subnet being asked for, which is the one on screen:
+   * clicking the button blurs the subnet field first, so an edit not yet
+   * committed has already been by the time this reads it.
+   */
+  async function toggleRecording() {
+    if (recordRequestInFlight) return;
+    const body = recordingState.active
+      ? { action: RECORD_ACTION_STOP }
+      : {
+          action: RECORD_ACTION_START,
+          subnet: requestedSubnet !== null ? requestedSubnet : viewedSubnet,
+        };
+
+    recordRequestInFlight = true;
+    recordError = '';
+    stoppedRecording = null;
+    renderRecording();
+    try {
+      const result = await postRecord(body);
+      if (result.error !== undefined) {
+        recordError = result.error;
+      } else {
+        recordingState = result.recording;
+        /* A 409 answers with the recording that won the race, so only a state
+           that really is finished is kept as one to report on. */
+        if (!recordingState.active) stoppedRecording = recordingState;
+      }
+    } catch (error) {
+      /* The poll reports the same server, so its own connection state already
+         says whether this is a blip or a server that has gone away. */
+      recordError = TEXT.record.unreachable;
+      console.warn(TEXT.record.unreachable, error);
+    } finally {
+      recordRequestInFlight = false;
+      renderRecording();
+    }
+  }
+
+  function initRecordControl() {
+    els.record.addEventListener('click', toggleRecording);
+    renderRecording();
   }
 
   // ── Row reconciliation ──────────────────────────────────────────────────
@@ -639,14 +932,17 @@
     return `${RATES_URL}?${new URLSearchParams({ [SUBNET_QUERY_PARAM]: subnet })}`;
   }
 
-  /** The sentence a 400 carries, falling back if the body is not the error shape. */
-  async function readRejection(response) {
+  /**
+   * The sentence a refusal carries, falling back if the body is not the
+   * `{error}` shape both endpoints answer with.
+   */
+  async function readErrorSentence(response, fallback) {
     try {
       const body = await response.json();
       const sentence = body && typeof body.error === 'string' ? body.error.trim() : '';
-      return sentence || TEXT.subnetRejected;
+      return sentence || fallback;
     } catch (error) {
-      return TEXT.subnetRejected;
+      return fallback;
     }
   }
 
@@ -662,7 +958,9 @@
         cache: 'no-store',
         signal: controller.signal,
       });
-      if (response.status === HTTP_BAD_REQUEST) return { rejection: await readRejection(response) };
+      if (response.status === HTTP_BAD_REQUEST) {
+        return { rejection: await readErrorSentence(response, TEXT.subnetRejected) };
+      }
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       return { payload: await response.json() };
     } finally {
@@ -673,6 +971,10 @@
   function applyPayload(payload) {
     renderCaptureStatus(payload.capture);
     acceptSubnet(payload.subnet);
+    /* After acceptSubnet, so the subnet a recording is compared against is the
+       one this payload was filtered to rather than the previous poll's. */
+    recordingState = normalizeRecording(payload.recording);
+    renderRecording();
     renderAxis(readWindowMs(payload));
     /* An empty list is a real answer - nothing has been seen yet, or nothing in
        this subnet - and empties the grid accordingly. A `devices` that is
@@ -721,5 +1023,6 @@
   }
 
   initSubnetControl();
+  initRecordControl();
   pollOnce();
 })();

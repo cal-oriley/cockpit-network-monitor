@@ -5,6 +5,12 @@
  * `grid-template-columns: var(--label-w) 1fr`, and the axis footer carries the
  * row's horizontal padding as its own, so every canvas and the time axis share
  * one vertical alignment no matter how wide the iframe is.
+ *
+ * That grid is the reason the page scales through a handful of custom
+ * properties rather than a set of small-screen rules: there is one layout at
+ * every size, and its measurements are the only thing that changes. Nothing
+ * claims a fixed height, and the document itself scrolls, so a panel too short
+ * for its content is scrolled through rather than clipping any part of it.
  */
 
 :root {
@@ -25,6 +31,7 @@
   --warn: #ffb02e;
   --warn-bg: rgba(255, 176, 46, 0.1);
   --danger: #ff6b6b;
+  --danger-glow: rgba(255, 107, 107, 0.15);
   --stale: #7c8899;
   --total-border: rgba(185, 139, 255, 0.4);
   --total-bg: #1d1e2f;
@@ -43,15 +50,29 @@
   --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   --font-mono: ui-monospace, "Cascadia Mono", "Segoe UI Mono", Consolas, "Liberation Mono", monospace;
 
-  /* Shared geometry */
-  --label-w: 12rem;
+  /*
+   * Shared geometry, and the whole of the page's scaling.
+   *
+   * Type comes from --base-font, since every font size on the page is in `rem`
+   * and so follows the root; the grid's own measurements are the rest. Each
+   * ceiling is the value the layout was fixed at when it only had to fit a
+   * comfortable window. Each floor matters more: it is where shrinking stops
+   * and scrolling takes over, because text scaled below readable is worse than
+   * a panel that has to be scrolled. The widths scale on `vw` and the heights
+   * on `vh`, so a panel that is short but wide keeps its label column.
+   */
+  --base-font: clamp(14px, 12.7px + 0.4vw, 16px);
+  --label-w: clamp(104px, 40px + 20vw, 192px);
+  --graph-h: clamp(30px, 12px + 5.5vh, 56px);
+  --header-pad-y: clamp(4px, 1px + 1vh, 10px);
+  --col-gap: clamp(8px, 2px + 1.8vw, 16px);
+  --page-pad-x: clamp(6px, 2px + 1.2vw, 12px);
+  --row-pad-x: clamp(6px, 2px + 1.2vw, 12px);
+
   --subnet-input-w: 9.5rem;
   --subnet-error-max-w: 22rem;
-  --col-gap: 1rem;
-  --page-pad-x: 0.75rem;
-  --row-pad-x: 0.75rem;
+  --strip-gap: 0.6rem;
   --row-border-w: 1px;
-  --graph-h: 3.5rem;
   --radius: 6px;
 }
 
@@ -65,25 +86,37 @@
   display: none !important;
 }
 
-html,
-body {
+html {
   height: 100%;
+  font-size: var(--base-font);
 }
 
+/*
+ * At least as tall as the panel so the axis footer sits at the bottom of a
+ * page with few rows, and free to grow past it so the document - header
+ * included - is what scrolls. Nothing is trapped in a nested scroller.
+ */
 body {
+  min-height: 100%;
   margin: 0;
-  overflow: hidden;
   display: flex;
   flex-direction: column;
   background: var(--bg);
   color: var(--text);
   font-family: var(--font-ui);
-  font-size: 14px;
+  font-size: 0.875rem;
   line-height: 1.35;
   -webkit-font-smoothing: antialiased;
 }
 
 /* ── Header ─────────────────────────────────────────────────────────────── */
+
+/*
+ * Information, plus the record control. It carries enough of both that wrapping
+ * onto further lines is the normal case in a narrow panel rather than an edge
+ * case, so its height follows its content and it never reserves a row it is
+ * not using.
+ */
 
 .header {
   flex: none;
@@ -92,7 +125,7 @@ body {
   align-items: baseline;
   justify-content: space-between;
   gap: 0.5rem 1rem;
-  padding: 0.6rem calc(var(--page-pad-x) + var(--row-pad-x));
+  padding: var(--header-pad-y) calc(var(--page-pad-x) + var(--row-pad-x));
   background: var(--bg-header);
   border-bottom: 1px solid var(--card-border);
 }
@@ -103,6 +136,7 @@ body {
   flex-wrap: wrap;
   align-items: baseline;
   gap: 0.5rem 0.75rem;
+  min-width: 0;
 }
 
 .header-title {
@@ -137,6 +171,7 @@ body {
 
 .subnet-input {
   width: var(--subnet-input-w);
+  max-width: 100%;
   padding: 0.1rem 0.4rem;
   border: 1px solid var(--card-border);
   border-radius: 4px;
@@ -172,6 +207,7 @@ body {
 }
 
 .subnet-error {
+  min-width: 0;
   max-width: var(--subnet-error-max-w);
   color: var(--danger);
   font-size: 0.72rem;
@@ -215,14 +251,115 @@ body {
 
 .connection[data-state="disconnected"] .connection-dot {
   background: var(--danger);
-  box-shadow: 0 0 0 3px rgba(255, 107, 107, 0.15);
+  box-shadow: 0 0 0 3px var(--danger-glow);
+}
+
+/* ── Record control ─────────────────────────────────────────────────────── */
+
+/*
+ * The one thing in the header that acts rather than reports, so it reads as a
+ * control at rest - the same faintly outlined chip as the subnet field - and
+ * takes the danger accent only while the server says a recording is running.
+ * `aria-pressed` is the styling hook as well as the announcement, so the look
+ * and what a screen reader is told cannot drift apart.
+ */
+
+.record-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.15rem 0.55rem;
+  border: 1px solid var(--card-border);
+  border-radius: 999px;
+  background: var(--card);
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 0.75rem;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: border-color 150ms ease, background-color 150ms ease, color 150ms ease;
+}
+
+.record-button:hover:enabled {
+  background: var(--card-hover);
+  border-color: var(--text-faint);
+  color: var(--text);
+}
+
+.record-button:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.record-button:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.record-button[aria-pressed="true"] {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.record-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border: 1px solid currentColor;
+  border-radius: 50%;
+}
+
+.record-button[aria-pressed="true"] .record-dot {
+  background: var(--danger);
+  box-shadow: 0 0 0 3px var(--danger-glow);
+}
+
+/*
+ * What is being written, kept out of the header because a recording's path is
+ * far longer than anything else there. Shown only while there is something to
+ * say: a running recording, or a sentence about one that could not start.
+ */
+
+.record-status {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.15rem 0.6rem;
+  min-width: 0;
+  margin: var(--strip-gap) calc(var(--page-pad-x) + var(--row-pad-x)) 0;
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+
+.record-state {
+  color: var(--text-faint);
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+/* Only a running recording earns the accent; a finished one is a past tense. */
+.record-status[data-active="true"] .record-state {
+  color: var(--danger);
+}
+
+.record-file,
+.record-rows {
+  min-width: 0;
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.record-note {
+  min-width: 0;
+  color: var(--warn);
 }
 
 /* ── Capture-status banner ──────────────────────────────────────────────── */
 
 .banner {
   flex: none;
-  margin: 0.6rem calc(var(--page-pad-x) + var(--row-pad-x)) 0;
+  margin: var(--strip-gap) calc(var(--page-pad-x) + var(--row-pad-x)) 0;
   padding: 0.5rem 0.7rem;
   border: 1px solid rgba(255, 176, 46, 0.35);
   border-left-width: 3px;
@@ -232,16 +369,7 @@ body {
   font-size: 0.82rem;
 }
 
-/* ── Scroll region: rows plus the pinned shared axis ────────────────────── */
-
-.scroll {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-  overflow-y: auto;
-  overflow-x: hidden;
-}
+/* ── Rows ───────────────────────────────────────────────────────────────── */
 
 .empty {
   flex: none;
@@ -251,6 +379,7 @@ body {
   font-size: 0.85rem;
 }
 
+/* Grows into a panel taller than its content, so the axis stays at the foot. */
 .rows {
   flex: 1 0 auto;
   display: flex;
@@ -258,8 +387,6 @@ body {
   gap: 0.4rem;
   padding: 0.6rem var(--page-pad-x) 0;
 }
-
-/* ── Rows ───────────────────────────────────────────────────────────────── */
 
 .grid-row {
   display: grid;
@@ -375,6 +502,13 @@ body {
 
 /* ── Shared time axis ───────────────────────────────────────────────────── */
 
+/*
+ * Pinned to the foot of the panel so a trace can be read against a time while
+ * the list scrolls past it. In a panel short enough that its row of labels is
+ * a sizeable fraction of the whole viewport, the row buys more as space for
+ * traffic than as a fixed reference, so there it scrolls with everything else.
+ */
+
 .axis-row {
   flex: none;
   position: sticky;
@@ -384,15 +518,30 @@ body {
   border-top: 1px solid var(--card-border);
 }
 
+@media (max-height: 400px) {
+  .axis-row {
+    position: static;
+  }
+}
+
 .axis {
   position: relative;
+  min-width: 0;
   height: 1.1rem;
 }
+
+/*
+ * A tick is a position, not a box: it carries no width of its own, and both the
+ * mark and the label hang off it absolutely. That is what keeps the last tick -
+ * whose label reaches back to the left of the point it marks - from widening
+ * the page it sits at the right edge of, which is the one way this row could
+ * put a horizontal scrollbar on the whole panel.
+ */
 
 .axis-tick {
   position: absolute;
   top: 0;
-  display: block;
+  width: 0;
 }
 
 .axis-tick::before {
@@ -406,8 +555,9 @@ body {
 }
 
 .axis-tick-label {
-  display: block;
-  padding-top: 0.35rem;
+  position: absolute;
+  top: 0.35rem;
+  left: 0;
   font-family: var(--font-mono);
   font-size: 0.68rem;
   color: var(--text-faint);
