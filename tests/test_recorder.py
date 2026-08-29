@@ -69,8 +69,12 @@ RecorderFactory = Callable[..., tuple[RateWindow, Recorder]]
 class FailingFile(io.StringIO):
     """A file whose writes fail the way a full disk does."""
 
+    def __init__(self, error: Exception | None = None) -> None:
+        super().__init__()
+        self._error = error or OSError(DISK_FULL)
+
     def write(self, data: str) -> int:
-        raise OSError(DISK_FULL)
+        raise self._error
 
 
 @pytest.fixture
@@ -631,12 +635,24 @@ def test_a_directory_that_cannot_be_created_answers_at_the_start(
     assert recorder.running is False
 
 
+@pytest.mark.parametrize(
+    "error", [OSError(DISK_FULL), RuntimeError(DISK_FULL), ValueError(DISK_FULL)]
+)
 def test_a_write_failure_stops_the_recording_and_names_the_path(
-    build: RecorderFactory, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+    build: RecorderFactory,
+    clock: FakeClock,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
 ) -> None:
-    """A dead writer must never leave the page saying it is still recording."""
+    """A dead writer must never leave the page saying it is still recording.
+
+    Whatever the writer raises - not only the disk errors that were expected -
+    has to end as a sentence rather than as a thread that quietly disappeared.
+    """
     window, recorder = build()
-    monkeypatch.setattr(recorder_module, "open_recording", lambda path: FailingFile())
+    monkeypatch.setattr(
+        recorder_module, "open_recording", lambda path: FailingFile(error)
+    )
     path, _ = start_recording(recorder)
     feed(window, *SUBNET_IPS)
     advance(clock)

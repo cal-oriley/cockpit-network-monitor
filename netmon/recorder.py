@@ -360,7 +360,12 @@ class Recorder:
                 # Every tick, so a kill loses at most one bucket rather than
                 # whatever the operating system was still holding.
                 session.file.flush()
-            except OSError as error:
+            except Exception as error:
+                # Broad on purpose, and the reason is the same one that makes
+                # the capture callback incapable of raising: an exception
+                # escaping here kills this thread, and a recording whose writer
+                # is dead while the page still says "recording" is the worst
+                # available outcome. Whatever went wrong becomes a sentence.
                 self._fail(session, error)
                 return
 
@@ -390,7 +395,7 @@ class Recorder:
         if not thread.is_alive():
             self._thread = None
 
-    def _fail(self, session: _Session, error: OSError) -> None:
+    def _fail(self, session: _Session, error: Exception) -> None:
         """Abandon a recording whose file will not take any more rows.
 
         Carrying on would leave the page reporting a recording that is no
