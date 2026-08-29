@@ -76,7 +76,7 @@ timestamp_iso,epoch_ms,ip,pps
 }
 ```
 
-- Present on **every** response, `active: false` with nulls when not recording — the page must never have to guess, and a missing key would read as "not recording" exactly when something had gone wrong.
+- Present on **every** response, `active: false` when not recording — the page must never have to guess, and a missing key would read as "not recording" exactly when something had gone wrong. Idle values are null **except `rows`, which is `0`**: a null count would force the page to guard arithmetic for no benefit, whereas zero is both true and directly usable.
 - `subnet` is the subnet the recording is fixed to, which may differ from the payload's own `subnet` once the viewer changes what they are looking at. The page should show it when they differ, since that is precisely the confusing case.
 - `rows` is the count written so far — the cheapest honest proof that recording is working.
 - `detail` is null normally, and a human-readable sentence if the recording has a problem (disk error, dropped buckets). The page shows it verbatim, exactly as it already does for capture problems.
