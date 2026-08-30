@@ -1,8 +1,8 @@
 # Packet Capture Feasibility
 
-> Reference material for the capture layer: why the stack is scapy over Npcap,
-> what the kernel filter is and deliberately is not, and the handful of scapy
-> behaviours the design has to work around.
+> Reference material for the capture layer: why the stack is our own read loop
+> over scapy over Npcap, what the kernel filter is and deliberately is not, and
+> the handful of scapy and driver behaviours the design has to work around.
 
 This document records the research and the measurements behind the capture
 design, so decisions about it start from evidence rather than a leap of faith.
@@ -40,9 +40,9 @@ built for.
 Three layers, each owned by someone other than us wherever possible:
 
 ```
-netmon/capture.py    reads pkt[IP].src, calls RateWindow.record
+netmon/capture.py    reads raw frames via pcap_next_ex, parses the source IP with struct
        |
-scapy                Python library, userspace, pip dependency
+scapy                opens and configures the socket: filter, promisc=False, immediate delivery
        |
 Npcap                kernel driver, does the actual capturing, one-time installer
        |
@@ -50,24 +50,33 @@ network adapter      packets arriving from the 192.168.2.x subnet
 ```
 
 The `filter` is a BPF expression compiled and applied **in the kernel**, so
-Python never sees packets that are not addressed to us. Header offsets and
-TCP-versus-UDP visibility are scapy and Npcap's tested territory rather than
-something this project has to validate.
+Python never sees packets that are not addressed to us. Socket setup — filter
+compilation, promiscuous mode, immediate delivery — and TCP-versus-UDP
+visibility are scapy and Npcap's tested territory rather than something this
+project has to validate. What the read loop adds on top is deliberately small:
+four bytes at a fixed offset.
 
-The integration is small, but not as small as a lambda:
+The integration is a socket scapy opens, plus a read loop of ours:
 
 ```python
 socket = conf.L2listen(iface=iface, filter=f"ip dst {host_ip}", promisc=False)
-sniffer = AsyncSniffer(opened_socket=socket, prn=on_packet, store=False,
-                       started_callback=on_started)
-sniffer.start()
+pcap_setbuff(socket.pcap_fd.pcap, KERNEL_BUFFER_BYTES)  # 8 MB of burst headroom
+parse = parser_for(socket.pcap_fd.datalink())           # Ethernet or DLT_NULL
+on_started()                                            # socket up: start confirmed
+
+while not stopping.is_set():
+    result = pcap_next_ex(handle, byref(header), byref(pkt_data))
+    if result > 0:
+        on_packet(parse(frame))  # must be incapable of raising - see below
+    elif result == 0:
+        continue                 # read timeout ticked over; stop lands here
+    else:
+        raise OSError(...)       # stored on the sniffer, ends the thread
 
 
-def on_packet(packet):
+def on_packet(source_ip):
     """Must be incapable of raising - see below."""
-    try:
-        source_ip = str(packet["IP"].src)
-    except Exception:
+    if source_ip is None:
         return
     try:
         window.record(source_ip)
@@ -77,10 +86,12 @@ def on_packet(packet):
 
 ### The callback guard is mandatory, not defensive habit
 
-**An exception raised inside `prn` terminates the entire capture.** Scapy's
-sniff loop catches it, closes the socket, drops it from the poll set and exits
-the thread — leaving `running` as `False` and, critically, `exception` as
-`None`. The failure appears nowhere but a log warning.
+**An exception escaping the read loop terminates the entire capture.** The
+loop's top level catches anything that escapes — a failed read, an unknown
+datalink, a callback that breaks its contract — stores it on the sniffer, and
+lets the thread exit. Nothing restarts it. That is deliberate rather than
+fragile: a capture that cannot read is a capture that is lying, so the failure
+is stored where `status()` will find it instead of being absorbed.
 
 That matters far more than it looks, because of how it lands on the page. The
 aggregator deliberately scrolls every device's window whether or not it is
@@ -89,16 +100,28 @@ to mean "this device went quiet". A dead capture makes **every** device render
 exactly that way: a stalled monitor that looks like working software, which is
 the one failure this program exists to make visible.
 
-An unguarded `packet[IP].src` is enough to reach it. `packet[IP]` raises on any
-non-IPv4 frame, so a single ARP or IPv6 packet slipping past the filter would
-end capture permanently.
+The parse cannot raise: a frame with no readable source address — malformed,
+truncated, not IPv4 — parses to `None` and is counted as unattributable. What
+remains guarded is the recording itself, wrapped so that a failure there costs
+one packet's attribution rather than the capture.
 
-The same asymmetry rules out trusting `running` as a health signal: it is set
-`True` before the socket is opened, so a setup failure leaves it `True` on a
-thread that is already dead. Liveness is derived instead from the combination
-of `started_callback` having fired, the stored `exception`, and
-`thread.is_alive()`, and it is re-derived on every poll rather than resolved
-once at startup.
+Liveness is derived, never assumed. The sniffer exposes **no `running` flag at
+all** — a boolean set before the socket opens is unreliable as a health signal,
+so nothing in the module is allowed to consult one. What it exposes instead is
+a start confirmation, fired only once the socket is open and the parser chosen;
+the stored `exception`; and the thread. The three map onto the capture states
+counterintuitively:
+
+| Condition    | started | exception | thread alive |
+|--------------|---------|-----------|--------------|
+| Healthy      | True    | None      | True         |
+| Setup failed | False   | set       | False        |
+| Died mid-run | True    | None      | False        |
+
+A stored exception always wins, and a start that was never confirmed is a
+failure even when nothing was raised. The mapping is re-derived on every poll
+rather than resolved once at startup, so a capture that dies at minute nine is
+reported at minute nine.
 
 ## The BPF filter, and why the subnet stays out of it
 
@@ -225,45 +248,53 @@ hide behind plausible-looking rates, so the driver's counters are read in normal
 operation rather than only under benchmark.
 
 Scapy 2.7.0 exposes no `stats()` wrapper, so this needs a small ctypes call
-against libpcap's `pcap_stats`, reached through the socket. That is why the
-socket is constructed by us and handed over as `opened_socket=` rather than
-letting `AsyncSniffer` build one from `iface=`. Two consequences follow:
-`AsyncSniffer` only auto-closes sockets it created, so this one's cleanup is
-ours; and the handle chain (`sock.pcap_fd.pcap`) is private scapy API and the
-likeliest thing to break on upgrade, which is the reason scapy is pinned to
+against libpcap's `pcap_stats`, reached through the socket. The socket is ours
+outright — scapy opens it, our loop reads it — so its cleanup is ours too, and
+the handle chain (`socket.pcap_fd.pcap`) it is reached through is private scapy
+API. That same chain also carries the read loop's `pcap_next_ex`, making it the
+likeliest thing to break on upgrade and the reason scapy is pinned to
 `>=2.7.0,<2.8`. The reader is one small function that degrades to "drops
 unknown" rather than crashing if that chain ever changes.
 
+What is done with the counters matters as much as reading them. The loss signal
+is the gap between `ps_recv` and the packets actually counted, not `ps_drop` —
+see [`ps_drop` under-reports](#ps_drop-under-reports-trust-the-gap-instead)
+below — and the `dropping_packets` capture state is derived from that gap as a
+ratio of received packets, with `ps_drop` carried into the detail sentence as
+corroboration.
+
 ## Performance: measure, do not guess
 
-Scapy builds a full structured object per packet, roughly 100–300 microseconds
-against dpkt's 2, implying a ceiling somewhere around 3,000–10,000
-packets/second. A BlueROV2 pushing video plus telemetry is on the order of
-1,000–5,000 packets/second, so this is plausibly fine but genuinely close enough
-to warrant checking.
+The capture path's ceiling was estimated, then measured, then profiled — and
+each step overturned the one before. The estimate put scapy's per-packet
+dissection at 100–300 microseconds and the ceiling around 3,000–10,000
+packets/second, against the 1,000–5,000 a BlueROV2 pushing video plus telemetry
+is expected to produce: plausibly fine, but genuinely close enough to warrant
+checking. The measurement found the ceiling at about 1,700 packets/second — the
+*bottom* of the expected range. The profile then attributed the 550–640
+microseconds of CPU per packet: roughly **88% of it was scapy's per-packet
+dissection (~400 microseconds)**, the driver read 40–65, the packet callback
+about 15.
 
-**Ship plain scapy and measure the observed packets-per-second ceiling** rather
-than pre-optimizing. The kernel BPF filter already removes the largest chunk of
-avoidable work. Dropped-packet counts are read alongside the rate, since a
-healthy-looking packet rate beside a rising drop count is precisely the silent
-failure to catch.
-
-If the measurement falls short, the contained fix is to keep scapy for capture
-and hand parsing to `dpkt`, which touches only `netmon/capture.py`.
+The only field this program has ever read is the source address, so the fix
+needed no parsing library: the loop reads raw frames with `pcap_next_ex` and
+unpacks those four bytes with the standard-library `struct` module, at about 40
+microseconds per packet all in, of which the parse itself is about 2. Scapy
+keeps the parts worth keeping — opening the socket, compiling the filter,
+configuring delivery — and the kernel buffer is enlarged to 8 MB with
+`pcap_setbuff`, so bursts and poll stalls become latency rather than loss.
 
 ## Measured throughput
 
-The estimate above is optimistic. **The capture path sustains about 1,700
-packets/second, and needs 0.94 of a core to do it** — roughly 550–640
-microseconds of CPU per packet rather than the 100–300 assumed above. Against
-the 1,000–5,000 packets/second a BlueROV2 is expected to produce, the ceiling
-sits at the *bottom* of the expected range. The margin is thin, not
-comfortable, and anything at the upper end of that range will not fit.
+**Zero drops at 20,000 packets/second offered, at 0.88 of a core.** The ceiling
+is above what the generator can offer, so this harness cannot find it; the
+1,000–5,000 packets/second a BlueROV2 is expected to produce sits well
+underneath it.
 
 The figures come from `tools/benchmark_capture.py`, a loopback sweep that drives
-the shipped capture path — Npcap, the kernel filter, scapy's dissection, the
-packet callback, `RateWindow.record` — against a paced UDP generator running in
-a separate process, thirty seconds per step. A 2 Hz poller runs against a real
+the shipped capture path — Npcap, the kernel filter, the frame read and parse,
+the packet callback, `RateWindow.record` — against a paced UDP generator running
+in a separate process, thirty seconds per step. A 2 Hz poller runs against a real
 `/api/rates` endpoint throughout, and the sweep repeats at three retained-address
 counts, because `RateWindow.snapshot` holds the lock the callback needs. Each
 step records four numbers together, since any one alone misleads: packets that
@@ -272,6 +303,13 @@ CPU time, and the generator's own send count as ground truth for offered load.
 
 `unproc` below is `ps_recv − ps_drop − counted`: packets the driver accepted and
 did not report as dropped, which nonetheless never reached the callback.
+
+**The table below measured the scapy-based path** — per-packet dissection in
+the callback, the architecture the profile above replaced. Its ceilings and
+per-packet costs describe that path, not the shipped one. It stands because its
+driver-level findings — `ps_drop` under-reporting, the kernel-buffer backlog —
+and its lock-contention findings are properties of Npcap and the aggregator
+rather than of the parser.
 
 | preload | offered | sent | counted | sustained pps | ps_recv | ps_drop | drop/recv | unproc | cores | poll mean ms | poll max ms |
 |--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
@@ -302,12 +340,13 @@ poller's own HTTP packets and ambient loopback traffic; the 0 pps rows measure
 that background at roughly 55 packets/second. The small negative `unproc` values
 are counter-read skew, all under 0.1% of `ps_recv`.
 
-The ceiling is a CPU wall, not a wait: at saturation the capture thread holds
-0.93–0.94 of a core, which at 1,694 packets/second is 553 microseconds each.
-The marginal cost derived from the unsaturated steps, with the idle baseline
-subtracted, is about 640 microseconds. One core divided by that cost is
-approximately the observed ceiling, which is what identifies the callback thread
-as the constraint.
+On that path the ceiling was a CPU wall, not a wait: at saturation the capture
+thread held 0.93–0.94 of a core, which at 1,694 packets/second is 553
+microseconds each. The marginal cost derived from the unsaturated steps, with
+the idle baseline subtracted, is about 640 microseconds. One core divided by
+that cost is approximately the observed ceiling, which is what identified the
+callback thread as the constraint — and what the profile above then attributed
+to dissection.
 
 ### `ps_drop` under-reports; trust the gap instead
 
@@ -318,6 +357,10 @@ were counted — the missing 7,903 were sitting in Npcap's kernel buffer, draini
 at 264 packets/second. The buffer absorbs several seconds of backlog and reports
 nothing wrong until it fills; the consistent 3,000–9,000 `unproc` figure across
 the saturated rows matches a roughly 1 MB buffer at about 116 bytes per packet.
+The capture requests an 8 MB buffer rather than accepting that default, which
+turns bursts into latency rather than loss — and lengthens the backlog that can
+accumulate silently before `ps_drop` admits anything, making the gap signal
+below more load-bearing, not less.
 
 Anything built on top of these counters must therefore treat **the gap between
 `ps_recv` and packets actually counted as the trustworthy loss signal**, not
@@ -331,19 +374,19 @@ gone quiet, and the drop counter agrees that nothing is wrong.
 ### Parsing cost versus lock contention
 
 Which of the two binds depends entirely on how many addresses the aggregator has
-retained:
+retained. On the scapy-based path the sweep measured:
 
-- **At a handful of addresses, parsing cost binds outright.** The 1,694
-  packets/second ceiling is set by CPU in the callback, and polling costs 14–43
+- **At a handful of addresses, parsing cost bound outright.** The 1,694
+  packets/second ceiling was set by CPU in the callback, and polling cost 14–43
   milliseconds without taking anything off the top.
-- **At 1,000 retained addresses, contention is already a 15% tax.** The ceiling
-  falls to 1,434 packets/second and poll latency roughly triples.
-- **At 10,000, contention wins completely** — an 88% collapse to about 200
-  packets/second. The tell is that the capture thread's CPU *falls*, from 0.94
-  of a core to 0.10: it is blocked on the lock rather than working. Poll latency
-  averages 660 milliseconds with a 1.44 second peak, so a 2 Hz poll demands
-  about 1.3 seconds of lock time per second and the aggregator is effectively
-  locked permanently.
+- **At 1,000 retained addresses, contention was already a 15% tax.** The ceiling
+  fell to 1,434 packets/second and poll latency roughly tripled.
+- **At 10,000, contention won completely** — an 88% collapse to about 200
+  packets/second. The tell is that the capture thread's CPU *fell*, from 0.94
+  of a core to 0.10: it was blocked on the lock rather than working. Poll
+  latency averaged 660 milliseconds with a 1.44 second peak, so a 2 Hz poll
+  demanded about 1.3 seconds of lock time per second and the aggregator was
+  effectively locked permanently.
 
 Two things about that are worth stating precisely. **Measuring `snapshot` in
 isolation understates the stall by four to five times** — around 100
@@ -353,58 +396,45 @@ both, so an isolated snapshot benchmark is not a safe guide to what a poll costs
 in production. And the retained-address count at which this matters is low:
 degradation is measurable at 1,000 addresses and severe at 10,000.
 
-For the intended deployment — one tether, a handful of devices — parsing cost is
-the binding constraint. Contention is a second and much steeper cliff that opens
-only if address retention runs away, which is what interface derivation from the
-host address exists to prevent.
+The lock those rows exercise — `snapshot` against `record` — is untouched by
+the parser swap, so the contention cliff stands even though its figures were
+measured with the slower callback. What the swap removes is the other
+constraint: with the parse at about 40 microseconds per packet, parsing cost no
+longer binds at any plausible vehicle rate. Contention is the remaining cliff,
+and it opens only if address retention runs away, which is what interface
+derivation from the host address exists to prevent.
 
-### The `dpkt` trigger, and where its thresholds fall
+### The `dpkt` trigger, retired unevaluated
 
-The trigger is: swapping parsing to `dpkt` is warranted if, at **twice the
-observed real-vehicle packet rate**, either `ps_drop / ps_recv` exceeds 0.001 or
-the capture thread exceeds about half a core.
-
-**It has not been evaluated.** Doing so requires a real vehicle rate from the
-hardware test, and none has been recorded. What the sweep fixes is where each
-half of the threshold falls, so the trigger can be applied the moment that number
-exists:
-
-- **Half a core** is crossed at about **730 packets/second** sustained
-  (interpolating 0.405 cores at 554 pps and 0.680 at 1,055). The CPU half
-  therefore fires at an observed vehicle rate above roughly **365
-  packets/second**.
-- **A drop ratio of 0.001** is crossed once offered load passes the ~1,700
-  packets/second service rate: zero drops at 1,055, 0.219 at 2,500 offered. The
-  drop half fires at an observed vehicle rate above roughly **850
-  packets/second**.
-
-The CPU half fires first, at about half the vehicle rate the drop half needs.
-
-**Profile before swapping the parser.** The sweep measures the whole userspace
-path without attributing cost within it, so it establishes the ceiling but not
-what sets it. If scapy's dissection really is 100–300 microseconds, then
-something else — scapy's per-packet socket and select loop, or the loopback
-datalink handling — accounts for the remainder of the 550–640 observed. `dpkt`
-replaces dissection only, so it may recover considerably less than the gap
-between 640 microseconds and dpkt's 2 implies. It is also not currently
-installed, making it a real new runtime dependency rather than a latent one.
+The trigger was fixed before the sweep ran: swapping parsing to `dpkt` was
+warranted if, at **twice the observed real-vehicle packet rate**, either
+`ps_drop / ps_recv` exceeded 0.001 or the capture thread exceeded about half a
+core. It is retired unevaluated. Profiling before swapping the parser — the
+sweep measured the whole userspace path without attributing cost within it —
+found ~88% of the per-packet cost in scapy's dissection, and the replacement
+turned out to be the standard library rather than dpkt: a `struct` unpack reads
+the source address in about 2 microseconds, the same figure dpkt manages for
+the same field, with no new dependency. There is nothing left for dpkt to
+recover.
 
 ### How far these numbers transfer
 
-They bound the **userspace ceiling** — driver, kernel filter, scapy dissection,
-callback, aggregator — which is the question the measurement exists to answer.
-They do not transfer as absolute figures for the tether:
+They bound the **userspace ceiling** — driver, kernel filter, frame read,
+parse, callback, aggregator — which is the question the measurement exists to
+answer. They do not transfer as absolute figures for the tether:
 
-- **Loopback is not Ethernet.** Npcap's loopback capture goes through the
-  Windows Filtering Platform with fabricated Ethernet headers. A physical NIC's
-  driver path, buffer sizing and drop accounting all differ.
+- **Loopback is not Ethernet.** Npcap's loopback device reports **DLT_NULL**: a
+  4-byte host-byte-order address-family header in place of an Ethernet header.
+  The parser handles both datalinks — DLT_NULL on loopback, DLT_EN10MB on a
+  physical adapter — so the framing difference is absorbed at the parse, but a
+  physical NIC's driver path, buffer sizing and drop accounting all differ.
 - **Packet size differed.** The generator sends 64-byte payloads; ROV video is
-  likely closer to 1,400-byte UDP. Scapy's cost is dominated by layer dissection
-  rather than payload length, so per-packet cost should be broadly comparable —
-  but that is an assumption, not a measurement, and a given bitrate at 1,400
-  bytes is far fewer packets.
-- **The buffer figure is this device's.** The roughly 9,000-packet backlog is
-  Npcap's default on the loopback adapter, and a physical adapter may differ.
+  likely closer to 1,400-byte UDP. The parse reads only fixed-offset header
+  bytes, so per-packet cost is independent of payload length — and a given
+  bitrate at 1,400 bytes is far fewer packets.
+- **The buffer figure is this device's.** The backlog figures above were
+  measured at Npcap's ~1 MB default on the loopback adapter; the capture
+  requests 8 MB, and a physical adapter's accounting may differ regardless.
 
 ## Breadcrumbs for macOS and Linux
 
