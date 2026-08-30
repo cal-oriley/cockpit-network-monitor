@@ -1,22 +1,25 @@
 """Tests for the passive packet-capture source.
 
-The trust boundary is the packet object scapy hands to the callback, so
+The trust boundary is the raw frame the driver hands to the read loop, so
 everything on this side of it is exercised with no hardware, no Npcap and - for
 the logic tests - no scapy at all. The sniffer itself is replaced by a fake that
-reproduces scapy's unhelpful failure signalling: ``running`` left ``True`` on a
-dead thread after a setup failure, and ``exception`` left ``None`` when the
-sniff loop kills itself over a raising callback.
+reproduces the failure signalling that matters: a start that is never confirmed,
+and a thread that dies mid-run with ``exception`` left unset.
 
-The handful of tests that do want the real dispatch loop run offline packets
-through ``scapy.sniff`` and skip cleanly when scapy is absent, so that a future
-release which changes whether a raising callback is fatal fails here rather than
-in the field.
+The handful of tests that do want scapy build real frames with it and feed
+their bytes to the raw parsers, skipping cleanly when scapy is absent, so that
+a future release whose byte layout differs from what the parsers assume fails
+here rather than in the field.
 """
 
 import importlib.util
+import socket
+import struct
 import subprocess
 import sys
-from collections.abc import Iterable
+import threading
+import time
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -38,10 +41,12 @@ from netmon.capture import (
     CaptureStatus,
     NpcapMissingError,
     derive_state,
-    extract_source_ip,
     filter_for,
     is_losing_packets,
     packets_lost,
+    parse_ipv4_src_en10mb,
+    parse_ipv4_src_null,
+    parser_for,
     select_interface,
 )
 from netmon.rate_window import RateWindow
@@ -94,15 +99,15 @@ class FakeThread:
 
 
 class FakeSniffer:
-    """Stands in for scapy's ``AsyncSniffer``, misleading signals included."""
+    """Stands in for the pcap sniffer, misleading signals included."""
 
     def __init__(self, iface, bpf_filter, on_packet, on_started) -> None:
         self.iface = iface
         self.filter = bpf_filter
         self.on_packet = on_packet
         self.on_started = on_started
-        # Nothing in the module is allowed to trust this, so it is left saying
-        # the wrong thing whenever scapy would.
+        # Nothing in the module is allowed to trust a running flag, so the
+        # fake keeps one and lets it say the wrong thing.
         self.running = False
         self.exception: BaseException | None = None
         self.thread: FakeThread | None = None
@@ -116,8 +121,8 @@ class FakeSniffer:
     def start(self) -> None:
         if self.start_raises is not None:
             raise self.start_raises
-        # scapy sets running before opening the socket, so a setup failure
-        # leaves it True on a thread that is already gone.
+        # A flag set before the socket opens would be left True on a thread
+        # that is already gone after a setup failure.
         self.running = True
         self.thread = FakeThread(self)
         if self.start_error is not None:
@@ -135,10 +140,11 @@ class FakeSniffer:
         self.running = False
 
     def die_mid_run(self) -> None:
-        """Reproduce a callback exception killing the sniff loop.
+        """Reproduce the read loop dying without storing an exception.
 
         ``running`` goes False, the thread exits, and ``exception`` is left
-        unset - the failure appears nowhere but a log warning.
+        unset - the failure appears nowhere unless the thread itself is
+        watched.
         """
         self.running = False
         self.alive = False
@@ -183,22 +189,33 @@ class RaisingFactory:
         raise self._error
 
 
-class FakeLayer:
-    def __init__(self, src: str) -> None:
-        self.src = src
+ETHERTYPE_IPV4 = 0x0800
+ETHERTYPE_ARP = 0x0806
+ETHERTYPE_IPV6 = 0x86DD
+AF_INET_HOST_ORDER = 2
+AF_INET6_HOST_ORDER = 23  # Windows AF_INET6, for the DLT_NULL family field
 
 
-class FakePacket:
-    """Minimal stand-in for a scapy packet's layer lookup."""
+def ipv4_header(src: str = DEVICE_IP, ihl_words: int = 5) -> bytes:
+    """A minimal IPv4 header; only the fields the parsers read are real."""
+    header = bytearray(ihl_words * 4)
+    header[0] = (4 << 4) | ihl_words
+    header[12:16] = socket.inet_aton(src)
+    return bytes(header)
 
-    def __init__(self, **layers: FakeLayer) -> None:
-        self._layers = layers
 
-    def __getitem__(self, name: str) -> FakeLayer:
-        try:
-            return self._layers[name]
-        except KeyError:
-            raise IndexError(f"Layer [{name!r}] not found") from None
+def ethernet_frame(
+    src: str = DEVICE_IP, ethertype: int = ETHERTYPE_IPV4, ihl_words: int = 5
+) -> bytes:
+    """An Ethernet frame carrying an IPv4 packet, or another ethertype's."""
+    body = ipv4_header(src, ihl_words) if ethertype == ETHERTYPE_IPV4 else b""
+    return b"\x00" * 12 + struct.pack("!H", ethertype) + body
+
+
+def null_frame(src: str = DEVICE_IP, family: int = AF_INET_HOST_ORDER) -> bytes:
+    """A DLT_NULL loopback frame: a host-byte-order family, then the packet."""
+    body = ipv4_header(src) if family == AF_INET_HOST_ORDER else b""
+    return struct.pack("<I", family) + body
 
 
 class RefusingWindow:
@@ -239,13 +256,11 @@ def recorded_addresses(window: RateWindow) -> list[str]:
 
 
 def feed_packets(
-    sniffer: FakeSniffer, count: int, packet: FakePacket | None = None
+    sniffer: FakeSniffer, count: int, source_ip: str | None = DEVICE_IP
 ) -> None:
     """Push ``count`` packets through the capture callback."""
-    if packet is None:
-        packet = FakePacket(IP=FakeLayer(DEVICE_IP))
     for _ in range(count):
-        sniffer.on_packet(packet)
+        sniffer.on_packet(source_ip)
 
 
 class FakeInterface:
@@ -263,12 +278,24 @@ class FakeIfaceTable:
         }
 
 
+class FakePcapFd:
+    """The slice of scapy's pcap wrapper the read loop reaches for."""
+
+    def __init__(self, datalink: int = capture.DLT_EN10MB) -> None:
+        self._datalink = datalink
+        self.pcap = object()  # the handle the ctypes calls would be aimed at
+
+    def datalink(self) -> int:
+        return self._datalink
+
+
 class FakePcapListenSocket:
     """Stands in for scapy's libpcap listen socket."""
 
     def __init__(self, **kwargs: Any) -> None:
         self.kwargs = kwargs
         self.closed = False
+        self.pcap_fd = FakePcapFd()
 
     def close(self) -> None:
         self.closed = True
@@ -283,30 +310,6 @@ class FakeNativeListenSocket:
 
     def __init__(self, **kwargs: Any) -> None:
         self.kwargs = kwargs
-
-
-class FakeAsyncSniffer:
-    """Stands in for the ``AsyncSniffer`` the pcap sniffer wraps."""
-
-    def __init__(self, **kwargs: Any) -> None:
-        self.kwargs = kwargs
-        self.exception: BaseException | None = None
-        self.thread: FakeThread | None = None
-        self.started = False
-        self.stopped = False
-
-    def start(self) -> None:
-        self.started = True
-
-    def stop(self, join: bool = True) -> None:
-        self.stopped = True
-
-
-class UnbuildableAsyncSniffer:
-    """A sniffer that cannot be constructed around an already-open socket."""
-
-    def __init__(self, **kwargs: Any) -> None:
-        raise RuntimeError(FAILURE_MESSAGE)
 
 
 class FakeConf:
@@ -330,17 +333,6 @@ class FakeConf:
         self.iface = OTHER_IFACE
 
 
-def recording_listen_socket(opened: list[FakePcapListenSocket]) -> type:
-    """A pcap listen-socket class that reports the sockets it opens."""
-
-    class RecordingListenSocket(FakePcapListenSocket):
-        def __init__(self, **kwargs: Any) -> None:
-            super().__init__(**kwargs)
-            opened.append(self)
-
-    return RecordingListenSocket
-
-
 def install_pcap_layer(
     monkeypatch: pytest.MonkeyPatch, conf: FakeConf | None = None
 ) -> FakeConf:
@@ -352,7 +344,6 @@ def install_pcap_layer(
     """
     conf = FakeConf() if conf is None else conf
     monkeypatch.setattr(capture, "_scapy_conf", lambda: conf)
-    monkeypatch.setattr(capture, "_async_sniffer_class", lambda: FakeAsyncSniffer)
     monkeypatch.setattr(
         capture, "_pcap_listen_socket_class", lambda: FakePcapListenSocket
     )
@@ -473,31 +464,70 @@ def test_scapys_own_primary_adapter_is_never_a_fallback(
 
 
 # --------------------------------------------------------------------------
-# Packet-to-IP extraction
+# Raw-frame parsing
 # --------------------------------------------------------------------------
 
 
-def test_the_source_address_of_an_ipv4_packet_is_extracted() -> None:
-    packet = FakePacket(IP=FakeLayer(DEVICE_IP))
+def test_the_source_address_of_an_ethernet_ipv4_frame_is_parsed() -> None:
+    assert parse_ipv4_src_en10mb(ethernet_frame()) == DEVICE_IP
 
-    assert extract_source_ip(packet) == DEVICE_IP
+
+def test_the_source_address_of_a_loopback_frame_is_parsed() -> None:
+    assert parse_ipv4_src_null(null_frame()) == DEVICE_IP
+
+
+def test_an_ipv4_header_with_options_is_parsed() -> None:
+    """A longer header is legal; the source address sits at a fixed offset."""
+    frame = ethernet_frame(ihl_words=6)
+
+    assert parse_ipv4_src_en10mb(frame) == DEVICE_IP
 
 
 @pytest.mark.parametrize(
-    "packet",
+    "frame",
     [
-        FakePacket(ARP=FakeLayer(DEVICE_IP)),
-        FakePacket(IPv6=FakeLayer("fe80::1")),
-        FakePacket(),
-        FakePacket(IP=FakeLayer("")),
-        None,
-        object(),
-        "not a packet",
-        42,
+        ethernet_frame(ethertype=ETHERTYPE_ARP),
+        ethernet_frame(ethertype=ETHERTYPE_IPV6),
+        ethernet_frame()[:20],  # truncated inside the IPv4 header
+        ethernet_frame()[:33],  # one byte short of the full IPv4 header
+        b"\x00" * 13,  # shorter than an Ethernet header
+        b"",
+        # Version nibble says 6 despite the IPv4 ethertype.
+        ethernet_frame()[:14] + bytes([0x65]) + ethernet_frame()[15:],
+        # IHL below the minimum contradicts the version.
+        ethernet_frame()[:14] + bytes([0x43]) + ethernet_frame()[15:],
     ],
 )
-def test_anything_without_a_usable_ipv4_layer_extracts_to_nothing(packet) -> None:
-    assert extract_source_ip(packet) is None
+def test_an_ethernet_frame_without_a_usable_ipv4_packet_parses_to_nothing(
+    frame: bytes,
+) -> None:
+    assert parse_ipv4_src_en10mb(frame) is None
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        null_frame(family=AF_INET6_HOST_ORDER),
+        null_frame()[:10],  # truncated inside the IPv4 header
+        b"\x02\x00\x00",  # shorter than the family header
+        b"",
+    ],
+)
+def test_a_loopback_frame_without_a_usable_ipv4_packet_parses_to_nothing(
+    frame: bytes,
+) -> None:
+    assert parse_ipv4_src_null(frame) is None
+
+
+def test_the_parser_matches_the_adapters_datalink_type() -> None:
+    assert parser_for(capture.DLT_EN10MB) is parse_ipv4_src_en10mb
+    assert parser_for(capture.DLT_NULL) is parse_ipv4_src_null
+
+
+def test_an_unknown_datalink_is_an_error_not_a_misparse() -> None:
+    """Every frame would be misread or discarded; the capture states report it."""
+    with pytest.raises(ValueError, match="datalink"):
+        parser_for(99)
 
 
 # --------------------------------------------------------------------------
@@ -564,7 +594,7 @@ def test_the_pure_logic_still_works_off_windows(
 
     assert filter_for(HOST_IP) == f"ip dst {HOST_IP}"
     assert derive_state(True, None, True) == CAPTURE_STATE_OK
-    assert extract_source_ip(FakePacket(IP=FakeLayer(DEVICE_IP))) == DEVICE_IP
+    assert parse_ipv4_src_en10mb(ethernet_frame()) == DEVICE_IP
 
 
 def test_importing_the_module_does_not_import_scapy() -> None:
@@ -853,35 +883,23 @@ def test_captured_packets_reach_the_aggregator(
     source = build_source(window, factory)
     source.start()
 
-    factory.sniffer.on_packet(FakePacket(IP=FakeLayer(DEVICE_IP)))
-    factory.sniffer.on_packet(FakePacket(IP=FakeLayer(OTHER_DEVICE_IP)))
-    factory.sniffer.on_packet(FakePacket(IP=FakeLayer(DEVICE_IP)))
+    factory.sniffer.on_packet(DEVICE_IP)
+    factory.sniffer.on_packet(OTHER_DEVICE_IP)
+    factory.sniffer.on_packet(DEVICE_IP)
 
     assert recorded_addresses(window) == [DEVICE_IP, OTHER_DEVICE_IP]
     assert window.snapshot()["devices"][0]["total_packets"] == 2
 
 
-@pytest.mark.parametrize(
-    "packet",
-    [
-        FakePacket(ARP=FakeLayer(DEVICE_IP)),
-        FakePacket(IPv6=FakeLayer("fe80::1")),
-        FakePacket(IP=FakeLayer("")),
-        FakePacket(),
-        None,
-        object(),
-        b"",
-    ],
-)
-def test_the_callback_never_raises_on_a_frame_it_cannot_read(
-    on_windows: None, window: RateWindow, packet
+def test_the_callback_never_raises_on_a_frame_without_an_address(
+    on_windows: None, window: RateWindow
 ) -> None:
     """One escaped exception would end the capture permanently."""
     factory = FakeSnifferFactory()
     source = build_source(window, factory)
     source.start()
 
-    factory.sniffer.on_packet(packet)
+    factory.sniffer.on_packet(None)
 
     assert recorded_addresses(window) == []
     assert source.status().state == CAPTURE_STATE_OK
@@ -894,8 +912,8 @@ def test_an_unreadable_frame_does_not_stop_later_ones_being_counted(
     source = build_source(window, factory)
     source.start()
 
-    factory.sniffer.on_packet(FakePacket(ARP=FakeLayer(DEVICE_IP)))
-    factory.sniffer.on_packet(FakePacket(IP=FakeLayer(DEVICE_IP)))
+    factory.sniffer.on_packet(None)
+    factory.sniffer.on_packet(DEVICE_IP)
 
     assert recorded_addresses(window) == [DEVICE_IP]
 
@@ -920,7 +938,7 @@ def test_an_aggregator_that_refuses_a_recording_does_not_end_the_capture(
     )
     source.start()
 
-    factory.sniffer.on_packet(FakePacket(IP=FakeLayer(DEVICE_IP)))
+    factory.sniffer.on_packet(DEVICE_IP)
     status = source.status()
 
     assert window.calls == 1
@@ -945,7 +963,7 @@ def test_a_refused_recording_is_described_as_what_it_was(
     )
     source.start()
 
-    factory.sniffer.on_packet(FakePacket(IP=FakeLayer(DEVICE_IP)))
+    factory.sniffer.on_packet(DEVICE_IP)
 
     assert "1 packets could not be attributed" in source.status().detail
 
@@ -957,8 +975,8 @@ def test_unattributable_packets_are_counted_and_surfaced(
     source = build_source(window, factory)
     source.start()
 
-    factory.sniffer.on_packet(FakePacket(ARP=FakeLayer(DEVICE_IP)))
-    factory.sniffer.on_packet(FakePacket())
+    factory.sniffer.on_packet(None)
+    factory.sniffer.on_packet(None)
 
     assert "2 packets" in source.status().detail
 
@@ -1098,9 +1116,7 @@ def test_frames_that_could_not_be_read_still_count_as_having_arrived(
     factory = FakeSnifferFactory(ReportingSniffer, drop_report=(RECEIVED_SAMPLE, 0))
     source = build_source(window, factory)
     source.start()
-    feed_packets(
-        factory.sniffer, RECEIVED_SAMPLE, FakePacket(ARP=FakeLayer(DEVICE_IP))
-    )
+    feed_packets(factory.sniffer, RECEIVED_SAMPLE, None)
 
     status = source.status()
 
@@ -1248,39 +1264,150 @@ def test_the_capture_socket_is_opened_without_promiscuous_mode(
     }
 
 
-def test_the_sniffer_reads_from_the_socket_we_opened(
+def wait_for(predicate: Callable[[], bool], timeout_s: float = 2.0) -> bool:
+    """Poll a condition the capture thread drives, giving up rather than hanging."""
+    deadline = time.monotonic() + timeout_s
+    while not predicate():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.005)
+    return True
+
+
+def fake_packet_source(
+    sniffer: capture._PcapSniffer, frames: list[bytes]
+) -> Callable[[], Iterator[bytes]]:
+    """A ``_packets`` stand-in: yields the frames, then waits for stop().
+
+    The real reader blocks in ``pcap_next_ex`` between packets, which is where
+    a stop lands; the fake waits on the same event.
+    """
+
+    def packets() -> Iterator[bytes]:
+        yield from frames
+        while not sniffer._stopping.is_set():
+            time.sleep(0.001)
+
+    return packets
+
+
+def test_frames_from_the_driver_are_parsed_and_handed_over(
     monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Drop counters are only reachable through a socket of our own, which is
-    why ``opened_socket`` is used in production rather than ``iface``."""
+    install_pcap_layer(monkeypatch)
+    received: list[str | None] = []
+    started = threading.Event()
+    sniffer = capture._PcapSniffer(
+        IFACE, filter_for(HOST_IP), received.append, started.set
+    )
+    sniffer._packets = fake_packet_source(
+        sniffer, [ethernet_frame(), ethernet_frame(OTHER_DEVICE_IP)]
+    )
+
+    sniffer.start()
+    assert wait_for(lambda: len(received) == 2)
+    sniffer.stop()
+
+    assert received == [DEVICE_IP, OTHER_DEVICE_IP]
+    assert started.is_set()
+    assert sniffer.exception is None
+    assert sniffer._socket.closed is True
+
+
+def test_a_read_error_is_stored_and_ends_the_thread(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An errored handle must not spin: the failure is stored and reported."""
+    install_pcap_layer(monkeypatch)
+    sniffer = capture._PcapSniffer(IFACE, filter_for(HOST_IP), ignore_packet, ignore_start)
+
+    def failing() -> Iterator[bytes]:
+        raise RuntimeError(FAILURE_MESSAGE)
+        yield  # unreachable; makes this a generator
+
+    sniffer._packets = failing
+
+    sniffer.start()
+    assert wait_for(lambda: sniffer.exception is not None)
+    sniffer.stop()
+
+    assert isinstance(sniffer.exception, RuntimeError)
+    assert FAILURE_MESSAGE in str(sniffer.exception)
+    assert sniffer.thread is not None and not sniffer.thread.is_alive()
+
+
+def test_a_callback_exception_is_stored_and_ends_the_thread(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The callback's contract is never to raise; a breach is fatal and visible.
+
+    A capture that cannot record is a capture that is lying, so the loop stops
+    and the stored exception is what ``status()`` reports - the failure is
+    never absorbed into a silently undercounting capture.
+    """
+    install_pcap_layer(monkeypatch)
+
+    def raising(source_ip: str | None) -> None:
+        raise RuntimeError(FAILURE_MESSAGE)
+
+    sniffer = capture._PcapSniffer(IFACE, filter_for(HOST_IP), raising, ignore_start)
+    sniffer._packets = fake_packet_source(sniffer, [ethernet_frame()])
+
+    sniffer.start()
+    assert wait_for(lambda: sniffer.exception is not None)
+    sniffer.stop()
+
+    assert isinstance(sniffer.exception, RuntimeError)
+
+
+def test_an_unknown_datalink_is_reported_before_any_packet_is_read(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_pcap_layer(monkeypatch)
+    started = threading.Event()
+    sniffer = capture._PcapSniffer(
+        IFACE, filter_for(HOST_IP), ignore_packet, started.set
+    )
+    sniffer._socket.pcap_fd = FakePcapFd(datalink=99)
+
+    sniffer.start()
+    assert wait_for(lambda: sniffer.exception is not None)
+    sniffer.stop()
+
+    assert isinstance(sniffer.exception, ValueError)
+    assert "datalink" in str(sniffer.exception)
+    assert not started.is_set()
+
+
+def test_the_kernel_buffer_is_enlarged_on_open(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    enlarged: list[capture._PcapSniffer] = []
+    monkeypatch.setattr(
+        capture._PcapSniffer,
+        "_enlarge_kernel_buffer",
+        lambda self: enlarged.append(self),
+    )
     install_pcap_layer(monkeypatch)
 
     sniffer = build_pcap_sniffer()
 
-    assert sniffer._sniffer.kwargs == {
-        "opened_socket": sniffer._socket,
-        "prn": ignore_packet,
-        "store": False,
-        "started_callback": ignore_start,
-    }
+    assert enlarged == [sniffer]
 
 
-def test_a_sniffer_that_cannot_be_built_releases_the_socket(
+def test_a_refused_kernel_buffer_enlargement_is_not_fatal(
     monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``AsyncSniffer`` closes only sockets it opened itself."""
-    opened: list[FakePcapListenSocket] = []
-    install_pcap_layer(
-        monkeypatch, FakeConf(listen_socket=recording_listen_socket(opened))
-    )
-    monkeypatch.setattr(
-        capture, "_async_sniffer_class", lambda: UnbuildableAsyncSniffer
-    )
+    """The default buffer remains, and the loss detection is the backstop.
 
-    with pytest.raises(RuntimeError, match=FAILURE_MESSAGE):
-        build_pcap_sniffer()
+    The fake handle is not a real ``pcap_t``, so the ctypes call always fails
+    here - construction succeeding anyway is the point.
+    """
+    install_pcap_layer(monkeypatch)
 
-    assert [socket.closed for socket in opened] == [True]
+    sniffer = build_pcap_sniffer()
+
+    assert sniffer._socket.closed is False
 
 
 def test_stopping_the_pcap_sniffer_releases_the_socket(
@@ -1288,64 +1415,61 @@ def test_stopping_the_pcap_sniffer_releases_the_socket(
 ) -> None:
     install_pcap_layer(monkeypatch)
     sniffer = build_pcap_sniffer()
+    sniffer._packets = fake_packet_source(sniffer, [])
     sniffer.start()
 
     sniffer.stop()
 
-    assert sniffer._sniffer.stopped is True
+    assert sniffer._socket.closed is True
+
+
+def test_stopping_a_sniffer_that_never_started_releases_the_socket(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_pcap_layer(monkeypatch)
+    sniffer = build_pcap_sniffer()
+
+    sniffer.stop()
+
     assert sniffer._socket.closed is True
 
 
 # --------------------------------------------------------------------------
-# Against scapy's real dispatch loop
+# Against scapy's real frame encoding
 # --------------------------------------------------------------------------
 
 
-def offline_frames() -> list:
-    """One frame of every kind the capture has to survive."""
+@requires_scapy
+def test_scapys_ethernet_encoding_matches_the_parser() -> None:
+    """The parser's byte assumptions are checked against scapy's own encoding.
+
+    A scapy release that changed what ``bytes(Ether()/IP()/UDP())`` produces
+    would break the parser's assumptions here rather than in the field.
+    """
     from scapy.all import ARP, IP, IPv6, UDP, Ether, Raw
 
-    return [
-        Ether() / IP(src=DEVICE_IP) / UDP(),
-        Ether() / ARP(),
-        Ether() / IPv6(src="fe80::1"),
-        Ether() / Raw(load=TRUNCATED_FRAME),
-        Ether() / IP(src=OTHER_DEVICE_IP) / UDP(),
-    ]
+    assert (
+        parse_ipv4_src_en10mb(bytes(Ether() / IP(src=DEVICE_IP) / UDP()))
+        == DEVICE_IP
+    )
+    assert (
+        parse_ipv4_src_en10mb(
+            bytes(Ether() / IP(src=DEVICE_IP) / UDP() / Raw(load=b"x" * 64))
+        )
+        == DEVICE_IP
+    )
+    assert parse_ipv4_src_en10mb(bytes(Ether() / ARP())) is None
+    assert parse_ipv4_src_en10mb(bytes(Ether() / IPv6(src="fe80::1"))) is None
+    assert parse_ipv4_src_en10mb(bytes(Ether() / Raw(load=TRUNCATED_FRAME))) is None
 
 
 @requires_scapy
-def test_a_raising_callback_really_does_end_a_real_capture() -> None:
-    """The premise of the whole design, asserted against scapy itself.
+def test_scapys_ipv4_encoding_matches_the_loopback_parser() -> None:
+    """DLT_NULL is the family header followed by the same IPv4 packet."""
+    from scapy.all import IP, UDP
 
-    If a future release stops treating a raising callback as fatal, this fails
-    loudly here instead of quietly changing what the module has to defend
-    against.
-    """
-    from scapy.all import sniff
+    frame = struct.pack("<I", AF_INET_HOST_ORDER) + bytes(
+        IP(src=DEVICE_IP) / UDP()
+    )
 
-    seen = []
-
-    def raising(packet) -> None:
-        seen.append(packet)
-        raise RuntimeError(FAILURE_MESSAGE)
-
-    sniff(offline=offline_frames(), prn=raising, store=False)
-
-    assert len(seen) == 1
-
-
-@requires_scapy
-def test_the_real_callback_survives_every_frame_and_keeps_counting(
-    on_windows: None, window: RateWindow
-) -> None:
-    from scapy.all import sniff
-
-    factory = FakeSnifferFactory()
-    source = build_source(window, factory)
-    source.start()
-
-    sniff(offline=offline_frames(), prn=factory.sniffer.on_packet, store=False)
-
-    assert recorded_addresses(window) == [DEVICE_IP, OTHER_DEVICE_IP]
-    assert source.status().state == CAPTURE_STATE_OK
+    assert parse_ipv4_src_null(frame) == DEVICE_IP

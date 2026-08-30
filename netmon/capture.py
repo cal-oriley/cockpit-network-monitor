@@ -6,19 +6,26 @@ holding the topside address, reads the source address of every packet arriving
 capture is not in the packet path, and promiscuous mode is switched off
 explicitly.
 
-Three properties of scapy's sniffer shape this module, and none of them are
-obvious from its documentation:
+The read loop is ours rather than scapy's sniffer, on measurement: scapy
+builds a full structured object per packet, which costs about 400 us of CPU -
+roughly 88% of the whole userspace path - and caps the capture near 1,700
+packets/second, inside the range a BlueROV2 is expected to produce. The only
+field this program has ever read is the source address, so the loop reads raw
+frames with ``pcap_next_ex`` and parses those four bytes with ``struct``,
+at about 37 us per packet all in. scapy still opens and configures the
+socket - filter compilation, promiscuous mode, immediate delivery - which is
+the tested territory worth keeping.
 
-* **An exception raised inside the packet callback ends the capture.** The
-  sniff loop catches it, warns, drops the socket and exits the thread - leaving
-  ``exception`` unset. Because the aggregator scrolls every device's window
-  whether or not it is sending, a dead capture renders as every device going
-  quiet, which is the one failure this program exists to make visible. The
-  callback here is therefore incapable of raising.
-* **``running`` is not a liveness signal.** It is set before the socket is
-  opened, so a setup failure leaves it ``True`` on a thread that is already
-  dead. State is derived from the combination of a start confirmation, the
-  stored exception and the thread - see :func:`derive_state`.
+Three invariants shape the module, and none of them are obvious:
+
+* **The packet callback is incapable of raising.** The read loop treats an
+  escaped exception as fatal: it is stored and the thread exits. Because the
+  aggregator scrolls every device's window whether or not it is sending, a
+  dead capture renders as every device going quiet, which is the one failure
+  this program exists to make visible - so a death is reported, never hidden.
+* **Liveness is derived, never assumed.** A start confirmation, the stored
+  exception and the thread together map onto the capture states - see
+  :func:`derive_state`.
 * **A failure is reported, never predicted.** Whether capture needs
   Administrator rights depends on how Npcap was installed, so elevation is only
   ever used to *explain* a permission error that actually occurred.
@@ -30,10 +37,12 @@ it, and ``import scapy.all`` costs seconds of architecture initialisation.
 
 import ctypes
 import ipaddress
+import socket
+import struct
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -41,13 +50,32 @@ from .rate_window import RateWindow
 
 WINDOWS_PLATFORM = "win32"
 IPV4_FAMILY = 4
-IPV4_LAYER = "IP"
 CAPTURE_FILTER_TEMPLATE = "ip dst {host_ip}"
 PERMISSION_MARKER = "permission"
 
 START_TIMEOUT_S = 5.0
 START_POLL_S = 0.05
 STOP_TIMEOUT_S = 2.0
+
+# libpcap datalink types the capture can parse. The tether adapter is
+# Ethernet; Npcap's loopback device, which the benchmark captures on, prepends
+# a 4-byte host-byte-order address-family header instead.
+DLT_NULL = 0
+DLT_EN10MB = 1
+NULL_HEADER_BYTES = 4
+ETHERNET_HEADER_BYTES = 14
+ETHERTYPE_IPV4 = 0x0800
+AF_INET_HOST_ORDER = 2  # the DLT_NULL family value for IPv4, on Windows
+IPV4_MIN_HEADER_BYTES = 20
+IPV4_SRC_OFFSET = 12  # within the IPv4 header
+IPV4_VERSION = 4
+
+# The kernel buffer Npcap fills while userspace is busy. The driver's default
+# is about 1 MB, which the benchmark showed absorbing only a few seconds of
+# backlog once the capture falls behind; the larger request turns poll stalls
+# and bursts into latency rather than loss. A refusal leaves the default in
+# place and costs nothing.
+KERNEL_BUFFER_BYTES = 8 * 2**20
 
 # Fraction of the received packets that may go uncounted before the loss is
 # worth an operator's attention. A capture that mislays a handful of packets
@@ -127,10 +155,10 @@ class NpcapMissingError(RuntimeError):
 
 
 class Sniffer(Protocol):
-    """The slice of scapy's ``AsyncSniffer`` this module depends on.
+    """The slice of a capture thread this module depends on.
 
-    ``running`` is deliberately absent: it is unreliable as a health signal, so
-    nothing here is allowed to consult it.
+    ``running`` is deliberately absent: a flag set before the socket opens is
+    unreliable as a health signal, so nothing here is allowed to consult one.
     """
 
     exception: BaseException | None
@@ -141,8 +169,10 @@ class Sniffer(Protocol):
     def stop(self, timeout: float) -> None: ...
 
 
+# The packet callback receives the parsed source address, or ``None`` for a
+# frame that had none readable.
 SnifferFactory = Callable[
-    [str, str, Callable[[Any], None], Callable[[], None]], Sniffer
+    [str, str, Callable[[str | None], None], Callable[[], None]], Sniffer
 ]
 
 
@@ -189,18 +219,60 @@ def select_interface(
     return names[0] if names else None
 
 
-def extract_source_ip(packet: Any) -> str | None:
-    """Source address of a captured IPv4 packet, or ``None`` if it has none.
+def _ipv4_src_at(frame: bytes, header_at: int) -> str | None:
+    """Source address of the IPv4 packet at ``header_at``, or ``None``.
 
-    Indexing the layer by name keeps this free of scapy imports, and the broad
-    guard is the point rather than laziness: ARP, IPv6 and truncated frames all
-    raise here, and one escaped exception ends the capture permanently.
+    The kernel filter has already accepted the frame as IPv4 addressed to the
+    host, so what remains is bounds-checking and four bytes. Anything that
+    fails those checks is malformed or truncated and counts as unattributable
+    rather than raising: one escaped exception ends the capture permanently.
     """
-    try:
-        source_ip = str(packet[IPV4_LAYER].src)
-    except Exception:
+    if len(frame) < header_at + IPV4_MIN_HEADER_BYTES:
         return None
-    return source_ip or None
+    version_ihl = frame[header_at]
+    ihl = (version_ihl & 0x0F) * 4
+    if version_ihl >> 4 != IPV4_VERSION or ihl < IPV4_MIN_HEADER_BYTES:
+        return None
+    if len(frame) < header_at + ihl:
+        return None
+    return socket.inet_ntoa(frame[header_at + IPV4_SRC_OFFSET :][:4])
+
+
+def parse_ipv4_src_en10mb(frame: bytes) -> str | None:
+    """Source address of an Ethernet/IPv4 frame, or ``None``.
+
+    802.1Q-tagged frames read as non-IPv4 here, which matches the kernel
+    filter: libpcap's ``ip dst`` does not match VLAN-tagged packets without
+    the ``vlan`` keyword, so they never reach this parser.
+    """
+    if len(frame) < ETHERNET_HEADER_BYTES + IPV4_MIN_HEADER_BYTES:
+        return None
+    if struct.unpack_from("!H", frame, 12)[0] != ETHERTYPE_IPV4:
+        return None
+    return _ipv4_src_at(frame, ETHERNET_HEADER_BYTES)
+
+
+def parse_ipv4_src_null(frame: bytes) -> str | None:
+    """Source address of a DLT_NULL loopback frame, or ``None``."""
+    if len(frame) < NULL_HEADER_BYTES + IPV4_MIN_HEADER_BYTES:
+        return None
+    if struct.unpack_from("<I", frame, 0)[0] != AF_INET_HOST_ORDER:
+        return None
+    return _ipv4_src_at(frame, NULL_HEADER_BYTES)
+
+
+def parser_for(datalink: int) -> Callable[[bytes], str | None]:
+    """The raw-frame parser matching an adapter's libpcap datalink type.
+
+    Anything else is a real error rather than a parse failure: a datalink this
+    module has no parser for means every frame would be misread or discarded,
+    which the capture states exist to report.
+    """
+    if datalink == DLT_EN10MB:
+        return parse_ipv4_src_en10mb
+    if datalink == DLT_NULL:
+        return parse_ipv4_src_null
+    raise ValueError(f"no parser for datalink {datalink}")
 
 
 def derive_state(
@@ -279,7 +351,7 @@ class CaptureSource:
     raises: every failure becomes a state reported by :meth:`status`.
 
     ``sniffer_factory`` is the seam the tests drive. It is called with the
-    resolved interface, the BPF filter, the packet callback and the
+    resolved interface, the BPF filter, the source-address callback and the
     start-confirmation callback, and returns a :class:`Sniffer`.
     """
 
@@ -419,16 +491,16 @@ class CaptureSource:
             if time.monotonic() >= deadline:
                 return
 
-    def _on_packet(self, packet: Any) -> None:
+    def _on_packet(self, source_ip: str | None) -> None:
         """Attribute one captured packet to its source address. Never raises.
 
-        See the module docstring: an exception escaping here would silently end
-        the capture and leave every device's trace scrolling along the
-        baseline, which is the picture that is supposed to mean "this device
-        went quiet".
+        See the module docstring: an exception escaping here would end the
+        capture and leave every device's trace scrolling along the baseline,
+        which is the picture that is supposed to mean "this device went quiet".
+        The sniffer hands over the parsed source address, so what remains is a
+        counter increment and one recording.
         """
         self._counted += 1
-        source_ip = extract_source_ip(packet)
         if source_ip is None:
             self._unattributed += 1
             return
@@ -473,23 +545,24 @@ class CaptureSource:
 
 
 class _PcapSniffer:
-    """Owns the libpcap socket and scapy's sniffing thread as one unit.
+    """Owns the libpcap socket and the capture thread as one unit.
 
-    The socket is opened here rather than left to ``AsyncSniffer(iface=...)``
-    because drop counts are only reachable through the socket object - and
-    ``AsyncSniffer`` closes only sockets it opened itself, so closing this one
-    is our job.
+    The socket is scapy's: opening it is filter compilation, promiscuous mode
+    and immediate-delivery territory that scapy has already tested, and the
+    drop counters are only reachable through the socket object. The read loop
+    is ours, on measurement - scapy's sniffer pays for a full packet
+    dissection per frame, the bulk of the per-packet cost, when the only field
+    this program reads is four bytes of IPv4 header.
     """
 
     def __init__(
         self,
         iface: str,
         bpf_filter: str,
-        on_packet: Callable[[Any], None],
+        on_packet: Callable[[str | None], None],
         on_started: Callable[[], None],
     ) -> None:
         conf = _require_pcap()
-        sniffer_class = _async_sniffer_class()
 
         # promisc=False explicitly: conf.sniff_promisc defaults to True and the
         # socket falls back to it, which would put the adapter into promiscuous
@@ -497,48 +570,110 @@ class _PcapSniffer:
         self._socket = conf.L2listen(
             iface=iface, filter=bpf_filter, promisc=False
         )
-        try:
-            self._sniffer = sniffer_class(
-                opened_socket=self._socket,
-                prn=on_packet,
-                store=False,
-                started_callback=on_started,
-            )
-        except Exception:
-            self._socket.close()
-            raise
+        self._on_packet = on_packet
+        self._on_started = on_started
+        self._exception: BaseException | None = None
+        self._thread: threading.Thread | None = None
+        self._stopping = threading.Event()
+        self._enlarge_kernel_buffer()
 
     @property
     def exception(self) -> BaseException | None:
-        return self._sniffer.exception
+        return self._exception
 
     @property
     def thread(self) -> threading.Thread | None:
-        return self._sniffer.thread
+        return self._thread
 
     def start(self) -> None:
-        self._sniffer.start()
+        thread = threading.Thread(
+            target=self._run, name="netmon-capture", daemon=True
+        )
+        self._thread = thread
+        thread.start()
 
     def stop(self, timeout: float = STOP_TIMEOUT_S) -> None:
-        """Ask the sniffer to finish, then release the socket.
+        """Stop the read loop, then release the socket. Never raises.
 
         The join is bounded rather than open-ended, and the socket is left
         alone if the thread outlives it: closing a handle a blocked reader is
         still holding trades a clean shutdown for a crash in the capture
-        thread. The thread is a daemon, so an unresponsive one cannot hold the
-        process open.
+        thread. The thread is a daemon and its read times out within 100 ms,
+        so an unresponsive one cannot hold the process open.
         """
-        try:
-            self._sniffer.stop(join=False)
-        except Exception:
-            # scapy raises when the sniffer is not running, which is exactly
-            # the case where there is nothing left to stop.
-            pass
-        thread = self._sniffer.thread
+        self._stopping.set()
+        thread = self._thread
         if thread is not None:
             thread.join(timeout)
         if thread is None or not thread.is_alive():
             self._socket.close()
+
+    def _run(self) -> None:
+        """Read frames, parse source addresses, feed the callback.
+
+        Any escape - a failed read, an unknown datalink, a callback that
+        breaks its contract - is stored and ends the thread: a capture that
+        cannot read is a capture that is lying, so the failure surfaces
+        through :meth:`CaptureSource.status` rather than being absorbed.
+        """
+        try:
+            parse = parser_for(self._socket.pcap_fd.datalink())
+            self._on_started()
+            for frame in self._packets():
+                self._on_packet(parse(frame))
+        except Exception as error:
+            self._exception = error
+
+    def _packets(self) -> Iterator[bytes]:
+        """Raw frames from the driver, until stopped or the read fails.
+
+        The return code is kept, which scapy's own wrapper does not do: it
+        collapses timeout and error into the same empty answer, and an errored
+        handle answers immediately, so treating an error as a timeout would
+        spin the loop at a full core while reporting nothing. The 100 ms read
+        timeout scapy configures on the handle is what lets a stop land
+        between packets.
+
+        ponytail: calls libpcap's ``pcap_next_ex`` through scapy's private
+        socket internals, because scapy exposes no read loop without its
+        dissection. Ceiling - the ``pcap_fd.pcap`` attribute chain and the
+        vendored ctypes binding are private API and, with the identical reach
+        in :meth:`drop_counts`, are the reason scapy is pinned below 2.8.
+        Upgrade path - none within scapy; a public raw-read API would replace
+        this whole method.
+        """
+        from scapy.libs.winpcapy import pcap_geterr, pcap_next_ex, pcap_pkthdr
+
+        header = ctypes.POINTER(pcap_pkthdr)()
+        pkt_data = ctypes.POINTER(ctypes.c_ubyte)()
+        handle = self._socket.pcap_fd.pcap
+        while not self._stopping.is_set():
+            result = pcap_next_ex(
+                handle, ctypes.byref(header), ctypes.byref(pkt_data)
+            )
+            if result > 0:
+                yield bytes(bytearray(pkt_data[: header.contents.caplen]))
+            elif result == 0:
+                continue  # the read timeout ticked over with no packet
+            else:
+                raise OSError(
+                    f"pcap read failed: "
+                    f"{pcap_geterr(handle).decode(errors='replace')}"
+                )
+
+    def _enlarge_kernel_buffer(self) -> None:
+        """Ask the driver for a bigger kernel buffer than its ~1 MB default.
+
+        A refusal or a missing binding leaves the default in place and costs
+        nothing, so both are quiet: the loss detection in ``status()`` is the
+        backstop either way.
+        """
+        try:
+            from scapy.libs.winpcapy import pcap_setbuff
+
+            pcap_setbuff(self._socket.pcap_fd.pcap, KERNEL_BUFFER_BYTES)
+        except Exception:
+            pass
 
     def drop_counts(self) -> tuple[int, int] | None:
         """``(received, dropped)`` from the capture driver, or ``None``.
@@ -549,9 +684,8 @@ class _PcapSniffer:
         fine here, and the guard below turns a Python-level failure into
         "unknown", but it could not catch a fault inside the C call. Locking is
         deliberately not added: the callback's hot path is budgeted at a
-        counter increment and the capture saturates near 1,700 packets per
-        second, so a lock there would cost more packets than these counters
-        exist to notice.
+        counter increment, so a lock there would cost more packets than these
+        counters exist to notice.
 
         ponytail: reaches libpcap's ``pcap_stats`` through scapy's private
         socket internals, because scapy 2.7 exposes no statistics wrapper.
@@ -577,13 +711,6 @@ def _scapy_conf() -> Any:
     from scapy.all import conf
 
     return conf
-
-
-def _async_sniffer_class() -> type:
-    """scapy's asynchronous sniffer class, imported lazily."""
-    from scapy.sendrecv import AsyncSniffer
-
-    return AsyncSniffer
 
 
 def _pcap_listen_socket_class() -> type:

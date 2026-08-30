@@ -42,7 +42,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from functools import partial
@@ -58,7 +58,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from netmon import capture  # noqa: E402
 from netmon.rate_window import RateWindow  # noqa: E402
-from netmon.server import RatesRequestHandler, parse_subnet  # noqa: E402
+from netmon.recorder import Recorder  # noqa: E402
+from netmon.server import (  # noqa: E402
+    RatesRequestHandler,
+    devices_in_subnet,
+    parse_subnet,
+)
 
 WINDOWS_PLATFORM = "win32"
 
@@ -85,6 +90,9 @@ DEFAULT_PAYLOAD_BYTES = 64
 DEFAULT_SERVER_PORT = 0
 DEFAULT_SUBNET = "192.168.2.0/24"
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "benchmark-results"
+# ``None`` keeps Npcap's own default kernel buffer, about 1 MB.
+DEFAULT_KERNEL_BUFFER_MB: float | None = None
+BYTES_PER_MB = 2**20
 
 SERVER_BIND_HOST = "127.0.0.1"
 SAMPLE_INTERVAL_S = 1.0
@@ -596,6 +604,36 @@ def _failed_step(
     )
 
 
+def buffered_sniffer_factory(size_bytes: int) -> capture.SnifferFactory:
+    """A sniffer factory that requests a larger kernel capture buffer.
+
+    Npcap's default buffer is about 1 MB, which the sweep showed absorbing only
+    a few seconds of backlog once the capture saturates. ``pcap_setbuff``
+    resizes it after activation - the one knob that turns "drops after N
+    seconds of deficit" into "drops after M times N seconds".
+
+    ponytail: reaches into the sniffer's private socket chain, the same way
+    :func:`read_counters` does. Ceiling - the ``pcap_fd.pcap`` attribute path
+    is private scapy API. Upgrade path - use whatever ``netmon.capture`` grows
+    for buffer sizing if it grows one.
+    """
+
+    def factory(
+        iface: str,
+        bpf_filter: str,
+        on_packet: Callable[[Any], None],
+        on_started: Callable[[], None],
+    ) -> capture.Sniffer:
+        from scapy.libs.winpcapy import pcap_setbuff
+
+        sniffer = capture._PcapSniffer(iface, bpf_filter, on_packet, on_started)
+        if pcap_setbuff(sniffer._socket.pcap_fd.pcap, size_bytes) != 0:
+            raise RuntimeError(f"pcap_setbuff({size_bytes}) was refused")
+        return sniffer
+
+    return factory
+
+
 def run_group(
     preload: int, args: argparse.Namespace, script: Path
 ) -> list[StepResult]:
@@ -614,7 +652,12 @@ def run_group(
     for address in preload_addresses(preload):
         window.record(address)
 
-    source = capture.CaptureSource(window, args.target_ip, iface=args.iface)
+    factory = None
+    if args.kernel_buffer_mb is not None:
+        factory = buffered_sniffer_factory(int(args.kernel_buffer_mb * BYTES_PER_MB))
+    source = capture.CaptureSource(
+        window, args.target_ip, iface=args.iface, sniffer_factory=factory
+    )
     server = ThreadingHTTPServer(
         (SERVER_BIND_HOST, args.server_port),
         partial(
@@ -623,6 +666,13 @@ def run_group(
             host_ip=args.target_ip,
             read_capture_status=source.status,
             default_subnet=parse_subnet(args.subnet),
+            # Never started, so nothing is ever written; the handler requires
+            # one regardless.
+            recorder=Recorder(
+                window=window,
+                recordings_dir=args.output_dir,
+                filter_devices=devices_in_subnet,
+            ),
         ),
     )
     server.daemon_threads = True
@@ -719,6 +769,7 @@ def write_results(
                     "rates_pps": list(args.rates),
                     "preload_addresses": list(args.preload),
                     "poll_interval_s": POLL_INTERVAL_S,
+                    "kernel_buffer_mb": args.kernel_buffer_mb,
                 },
                 "steps": [asdict(result) for result in results],
             },
@@ -966,6 +1017,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=DEFAULT_OUTPUT_DIR,
         help=f"where the JSON and CSV results are written (default: {DEFAULT_OUTPUT_DIR})",
+    )
+    sweep.add_argument(
+        "--kernel-buffer-mb",
+        type=float,
+        default=DEFAULT_KERNEL_BUFFER_MB,
+        metavar="MB",
+        help="kernel capture buffer size to request via pcap_setbuff; omit to "
+        "keep Npcap's default of about 1 MB",
     )
     _add_traffic_arguments(sweep)
     sweep.set_defaults(handler=run_sweep)
