@@ -43,5 +43,11 @@ desktop.ini
 # Logs
 *.log
 
+# Recorded traffic
+recordings/
+
+# Benchmark output
+tools/benchmark-results/
+
 # Local commit scratchpad
 CHANGELOG.txt

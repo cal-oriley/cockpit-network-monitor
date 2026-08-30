@@ -1,144 +1,95 @@
-"""Tests for the rates endpoint, its subnet filtering, and the CLI.
+"""Tests for the rates endpoint: its payload, capture status, and filtering.
 
 The endpoint's contract - what is served, what is filtered out, and what an
 unusable subnet gets back - is asserted end to end against a handler running on
 a loopback port, fed by a fake-clocked window so nothing sleeps and no reading
 depends on real time.
+
+The record endpoint has its own module, as does the command line; the harness
+all three share lives in ``conftest``.
 """
 
-import json
-import threading
-import urllib.error
 import urllib.request
-from collections.abc import Iterator
-from contextlib import contextmanager
-from dataclasses import dataclass
-from email.message import Message
-from functools import partial
 from http import HTTPStatus
-from http.server import ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
-from urllib.parse import quote
 
 import pytest
 
 from netmon import server
+from netmon.capture import (
+    CAPTURE_STATE_CAPTURE_DIED,
+    CAPTURE_STATE_DROPPING_PACKETS,
+    CAPTURE_STATE_NOT_RUNNING,
+    CAPTURE_STATE_OK,
+    CaptureStatus,
+)
+from netmon.mock_source import MockSource
 from netmon.rate_window import RateWindow
 from netmon.server import (
     CAPTURE_STATE_DETAILS,
-    CAPTURE_STATE_ERROR,
     CAPTURE_STATE_MOCK,
-    DEFAULT_BIND_HOST,
     DEFAULT_HOST_IP,
-    DEFAULT_PORT,
     DEFAULT_SUBNET,
     JSON_CONTENT_TYPE,
     NO_STORE,
-    RATES_PATH,
-    SUBNET_PARAM,
-    RatesRequestHandler,
-    build_parser,
+    UNKNOWN_CAPTURE_DETAIL,
     capture_status_for,
+    capture_status_reader,
     devices_in_subnet,
     parse_subnet,
-    resolve_capture_status,
 )
 
-from .conftest import FakeClock
+from .conftest import (
+    BUCKET_MS,
+    DEFAULT_SUBNET_IPS,
+    INVALID_SUBNETS,
+    INVENTED_STATE,
+    MALFORMED_IP,
+    PACKETS_PER_BUCKET,
+    RECORDING_KEYS,
+    REQUEST_TIMEOUT_S,
+    SECOND_SUBNET,
+    SECOND_SUBNET_IPS,
+    WINDOW_BUCKETS,
+    FakeClock,
+    Response,
+    fetch_rates,
+    populated_window,
+    serving,
+)
 
-INVENTED_STATE = "adapter_on_fire"
-
-BUCKET_MS = 250
-BUCKET_S = BUCKET_MS / 1000
-WINDOW_BUCKETS = 8
-PACKETS_PER_BUCKET = 3
+PAYLOAD_KEYS = {
+    "host_ip",
+    "subnet",
+    "capture",
+    "recording",
+    "bucket_ms",
+    "buckets",
+    "now_ms",
+    "devices",
+}
+CAPTURE_KEYS = {"state", "detail"}
 
 INDEX_PATH = "/"
 HTML_CONTENT_TYPE = "text/html"
 PAGE_TITLE_MARKUP = "<title>Subnet Traffic</title>"
 
-LOOPBACK = "127.0.0.1"
-EPHEMERAL_PORT = 0
-REQUEST_TIMEOUT_S = 5.0
-SHUTDOWN_TIMEOUT_S = 5.0
 
-DEFAULT_SUBNET_IPS = ("192.168.2.2", "192.168.2.10")
-SECOND_SUBNET_IPS = ("10.11.12.2", "10.11.12.3")
-SECOND_SUBNET = "10.11.12.0/24"
-MALFORMED_IP = "not-an-ip"
+class ChangingStatus:
+    """A reader whose answer differs every time it is called.
 
-INVALID_SUBNETS = [
-    "nonsense",
-    "192.168.2.0/33",
-    "192.168.2.1/24",
-    "",
-    "192.168.2.0/",
-    "1.2.3.4.5/24",
-]
+    Stands in for a capture whose health changes while the server is up, which
+    a status resolved once at startup could never report.
+    """
 
+    def __init__(self, *states: str) -> None:
+        self._states = list(states)
+        self.calls = 0
 
-@dataclass(frozen=True)
-class Response:
-    """One HTTP answer, decoded."""
-
-    status: int
-    content_type: str | None
-    cache_control: str | None
-    body: dict[str, Any]
-
-
-def populated_window(clock: FakeClock) -> RateWindow:
-    """A window holding one completed bucket of traffic from both subnets."""
-    window = RateWindow(bucket_ms=BUCKET_MS, buckets=WINDOW_BUCKETS, clock=clock)
-    for ip in (*DEFAULT_SUBNET_IPS, *SECOND_SUBNET_IPS, MALFORMED_IP):
-        window.record(ip, PACKETS_PER_BUCKET)
-    clock.advance(BUCKET_S)
-    return window
-
-
-@contextmanager
-def serving(window: RateWindow, default_subnet: str = DEFAULT_SUBNET) -> Iterator[str]:
-    """Run the handler on a loopback port and yield its base URL."""
-    handler = partial(
-        RatesRequestHandler,
-        window=window,
-        host_ip=DEFAULT_HOST_IP,
-        capture=capture_status_for(CAPTURE_STATE_MOCK),
-        default_subnet=parse_subnet(default_subnet),
-    )
-    httpd = ThreadingHTTPServer((LOOPBACK, EPHEMERAL_PORT), handler)
-    httpd.daemon_threads = True
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield f"http://{LOOPBACK}:{httpd.server_address[1]}"
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-        thread.join(SHUTDOWN_TIMEOUT_S)
-
-
-def fetch_rates(base_url: str, subnet: str | None = None) -> Response:
-    """GET the rates endpoint, optionally asking for a particular subnet."""
-    url = f"{base_url}{RATES_PATH}"
-    if subnet is not None:
-        url = f"{url}?{SUBNET_PARAM}={quote(subnet, safe='')}"
-    try:
-        with urllib.request.urlopen(url, timeout=REQUEST_TIMEOUT_S) as answer:
-            return _decode(answer.status, answer.headers, answer.read())
-    except urllib.error.HTTPError as error:
-        with error:
-            return _decode(error.status, error.headers, error.read())
-
-
-def _decode(status: int, headers: Message, body: bytes) -> Response:
-    return Response(
-        status=status,
-        content_type=headers.get("Content-Type"),
-        cache_control=headers.get("Cache-Control"),
-        body=json.loads(body),
-    )
+    def __call__(self) -> CaptureStatus:
+        state = self._states[min(self.calls, len(self._states) - 1)]
+        self.calls += 1
+        return capture_status_for(state)
 
 
 def fetch_index(base_url: str) -> tuple[int, str, str]:
@@ -176,21 +127,48 @@ def test_unknown_states_are_accepted_and_described() -> None:
     assert INVENTED_STATE in status.detail
 
 
-def test_mock_traffic_is_reported_as_such() -> None:
-    assert resolve_capture_status(mock=True, forced=None).state == CAPTURE_STATE_MOCK
+@pytest.mark.parametrize(
+    "state",
+    [
+        CAPTURE_STATE_CAPTURE_DIED,
+        CAPTURE_STATE_NOT_RUNNING,
+        CAPTURE_STATE_DROPPING_PACKETS,
+    ],
+)
+def test_the_states_only_a_running_capture_produces_can_be_reviewed(
+    state: str,
+) -> None:
+    """--capture-status exists to see banners this machine cannot produce."""
+    status = capture_status_for(state)
+
+    assert status.state == state
+    assert status.detail != UNKNOWN_CAPTURE_DETAIL.format(state=state)
 
 
-def test_a_forced_state_wins_over_the_mock_flag() -> None:
-    status = resolve_capture_status(mock=True, forced=INVENTED_STATE)
+def test_without_a_forced_state_the_sources_own_reader_is_used() -> None:
+    live = ChangingStatus(CAPTURE_STATE_OK)
 
-    assert status.state == INVENTED_STATE
+    assert capture_status_reader(live, None) is live
 
 
-def test_running_without_any_source_is_reported_as_an_error() -> None:
-    status = resolve_capture_status(mock=False, forced=None)
+@pytest.mark.parametrize(
+    "forced", [INVENTED_STATE, CAPTURE_STATE_CAPTURE_DIED, CAPTURE_STATE_NOT_RUNNING]
+)
+def test_a_forced_state_overrides_whatever_the_source_reports(forced: str) -> None:
+    live = ChangingStatus(CAPTURE_STATE_OK)
 
-    assert status.state == CAPTURE_STATE_ERROR
-    assert "--mock" in status.detail
+    reader = capture_status_reader(live, forced)
+
+    assert reader().state == forced
+    assert live.calls == 0
+
+
+def test_the_mock_source_supplies_the_mock_state(clock: FakeClock) -> None:
+    window = RateWindow(bucket_ms=BUCKET_MS, buckets=WINDOW_BUCKETS, clock=clock)
+
+    reader = capture_status_reader(MockSource(window).status, None)
+
+    assert reader().state == CAPTURE_STATE_MOCK
 
 
 def test_web_directory_is_resolved_from_the_package_not_the_cwd() -> None:
@@ -261,6 +239,46 @@ def test_omitting_the_parameter_serves_the_default_subnet(clock: FakeClock) -> N
         len(device["pps"]) == response.body["buckets"]
         for device in response.body["devices"]
     )
+
+
+def test_the_payload_carries_exactly_the_documented_keys(clock: FakeClock) -> None:
+    with serving(populated_window(clock)) as base_url:
+        response = fetch_rates(base_url)
+
+    assert set(response.body) == PAYLOAD_KEYS
+    assert set(response.body["capture"]) == CAPTURE_KEYS
+    assert set(response.body["recording"]) == RECORDING_KEYS
+
+
+def test_the_capture_status_is_read_again_for_every_poll(clock: FakeClock) -> None:
+    """The regression guard for a status frozen at startup.
+
+    A capture that dies at minute nine has to be reported at minute nine: the
+    page draws a dead capture as every device falling quiet, which is exactly
+    the picture that is supposed to mean a device went quiet.
+    """
+    live = ChangingStatus(CAPTURE_STATE_OK, CAPTURE_STATE_CAPTURE_DIED)
+
+    with serving(populated_window(clock), read_capture_status=live) as base_url:
+        first = fetch_rates(base_url)
+        second = fetch_rates(base_url)
+
+    assert first.body["capture"]["state"] == CAPTURE_STATE_OK
+    assert second.body["capture"]["state"] == CAPTURE_STATE_CAPTURE_DIED
+    assert live.calls == 2
+
+
+@pytest.mark.parametrize(
+    "state", [CAPTURE_STATE_OK, CAPTURE_STATE_CAPTURE_DIED, INVENTED_STATE]
+)
+def test_the_capture_object_is_always_emitted(clock: FakeClock, state: str) -> None:
+    """A payload with no capture object is rendered as healthy by the page."""
+    with serving(
+        populated_window(clock), read_capture_status=ChangingStatus(state)
+    ) as base_url:
+        response = fetch_rates(base_url)
+
+    assert response.body["capture"] == capture_status_for(state).as_dict()
 
 
 def test_a_requested_subnet_overrides_the_default(clock: FakeClock) -> None:
@@ -338,30 +356,3 @@ def test_two_pages_can_watch_different_subnets_at_once(clock: FakeClock) -> None
 
     assert follow_up.body["subnet"] == DEFAULT_SUBNET
     assert served_ips(follow_up) == list(DEFAULT_SUBNET_IPS)
-
-
-def test_cli_defaults_match_the_documented_ones() -> None:
-    args = build_parser().parse_args([])
-
-    assert args.port == DEFAULT_PORT
-    assert args.host == DEFAULT_BIND_HOST
-    assert args.host_ip == DEFAULT_HOST_IP
-    assert args.subnet == DEFAULT_SUBNET
-    assert args.mock is False
-    assert args.capture_status is None
-
-
-def test_cli_accepts_an_invented_capture_state() -> None:
-    args = build_parser().parse_args(["--capture-status", INVENTED_STATE])
-
-    assert args.capture_status == INVENTED_STATE
-
-
-def test_an_unusable_default_subnet_fails_at_startup(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    with pytest.raises(SystemExit) as exit_info:
-        server.main(["--subnet", "nonsense"])
-
-    assert exit_info.value.code != 0
-    assert "CIDR" in capsys.readouterr().err

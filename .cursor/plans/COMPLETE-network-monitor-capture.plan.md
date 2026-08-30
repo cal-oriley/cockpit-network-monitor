@@ -145,7 +145,9 @@ def filter_for(host_ip: str) -> str: ...              # "ip dst <host_ip>"; neve
 def select_interface(host_ip: str) -> str | None: ... # NPF network_name, or None
 ```
 
-`CaptureStatus` is **imported from `netmon/server.py` as it exists today** rather than redeclared, so the JSON shape provably cannot drift between the two modules.
+**`CaptureStatus` moves into `netmon/capture.py`**, and `server.py` imports it from there. It is currently declared in `server.py`, but the dependency has to run **server → capture**, not the reverse: `server.py` constructs the source, so a capture module importing back from the server would be circular. Moving the dataclass rather than redeclaring it keeps one definition, so the JSON shape provably cannot drift. Doer 1 defines it; Doer 2 deletes the old declaration and repoints the import in the same task that wires the source in.
+
+**scapy is imported lazily, inside the functions that need it — never at module scope.** Importing `netmon.capture` must not require scapy, for three reasons that all matter: `--mock` has to keep working on a machine without scapy installed, the pure-logic tests (state derivation, platform dispatch, filter construction) must run without it, and `import scapy.all` costs seconds of arch initialization against a suite that currently runs in about nine. Platform dispatch and `CaptureStatus` therefore stay importable on any OS, and an unsupported platform reports `unsupported_platform` rather than failing at import.
 
 `start()` and `stop()` mirror `MockSource`'s lifecycle exactly so `main()` can treat the two interchangeably. Neither raises: a failure to open, a bad filter, a missing interface, or a dead thread all surface through `status()`.
 
@@ -172,7 +174,17 @@ One caveat the new states must respect: a **missing** `capture` object is render
 | `interface_missing` | No adapter carries `--host-ip` |
 | `needs_elevation` | A permission failure actually occurred on open — never predicted from an is-admin check |
 | `error` | Any other stored sniffer exception; `detail` carries its message |
-| *dead-sniffer state* | Started successfully, then the thread exited (see finding 1) |
+| `capture_died` | Started successfully, then the thread exited (see finding 1) |
+| `not_running` | `status()` called before `start()` or after `stop()` |
+| `dropping_packets` | Capture is running, but the kernel is discarding packets faster than a set tolerance |
+
+**`dropping_packets` is why drop counts are read in production at all.** Appending them to `ok`'s detail is not enough: the page renders the banner only when the state is neither `ok` nor `mock`, so drops reported inside `ok` reach the JSON and are shown to nobody. Since silent kernel drops are the failure mode this whole phase exists to make visible, the condition needs its own state — which then surfaces through the existing banner with **no frontend change**, exactly the payoff the open state set was built for.
+
+**Do not base it on `ps_drop` alone — measurement proved that misses the case.** In the sweep, a saturated capture read `ps_drop` of **zero** while only half the received packets had reached the callback: the rest were sitting in Npcap's kernel buffer, which absorbs several seconds of backlog and reports nothing wrong until it fills. The honest signal is the gap between `ps_recv` and what we actually counted, so the condition is evaluated on **received minus counted**, with `ps_drop` as corroboration rather than as the trigger.
+
+Report it above a **ratio** rather than on any non-zero count, using the same 0.001 of received packets as the `dpkt` trigger below, so a brief blip while the capture warms up does not nag an operator forever while a sustained loss does. The `detail` sentence carries the actual received and dropped counts, since "some packets were dropped" is not actionable but "1,240 of 900,000" is. A device's rates are **undercounted** while this is true, which is the operator-facing consequence worth stating in the sentence.
+
+`not_running` exists because `status()` is callable outside the sniffer's lifetime, and reporting that as `capture_died` would be a lie. Both are values the frontend has never seen and needs no change to render — but both must appear in the server's forced-state detail table so `--capture-status capture_died` reviews sensibly in a browser.
 
 Forcing pcap deserves its own note: `conf.use_pcap` must be **asserted after importing `scapy.all`**, not set before. Read from `scapy.config` alone it reports `False` because the arch layer has not initialized, so an assertion in the wrong place fails spuriously. Assert both `conf.use_pcap` and that `conf.L2listen` is the pcap listen socket, since the former does not prove the latter — this is what stops scapy silently substituting its native socket, the one that cannot see incoming TCP.
 
@@ -224,6 +236,8 @@ Reuse the existing canvas drawing and reconciliation paths rather than adding a 
 - `README.md`, `requirements.txt`
 - The prose corrections in `docs/capture-feasibility.md`
 
+`README.md` also needs a line for the **total-traffic graph** from task U: its overview currently describes the page as a graph per device, with no mention of the combined trace at the top of the stack.
+
 `README.md` gets a specific instruction here, to run **last, once capture actually works**: strip every mention of the phases. The phase scaffolding existed to explain why a UI shipped with no packet capture behind it; once capture lands, a reader arriving at the project does not care that it was built in stages, and "Phase 2" reads as an unfinished promise rather than history. The README should describe the tool as it is — install, run, what the page shows, the flags — with no phase language anywhere. Phase history stays in git and in the plans, which is where the development path belongs.
 
 **Doer U — total-traffic graph (exclusive write, parallel with the capture work):**
@@ -234,7 +248,7 @@ This is the only task that touches `web/`, and no capture task touches it at all
 
 **Organizer:** this plan file, `AGENTS.md`.
 
-`docs/capture-feasibility.md` is touched by both Doer 3 and Doer 4, so it is **split by section**: Doer 4 owns the prose corrections, Doer 3 appends measured results to a results section Doer 4 creates. They must not run concurrently against it — the sequence below keeps them apart.
+`docs/capture-feasibility.md` is touched by both Doer 3 and Doer 4, so it is **split in time rather than ordered by task**: Doer 4 owns the whole document during its run, including creating an empty results section. Doer 3 does **not** touch it at all while running — it owns `tools/` alone and reports its measured numbers back — and is then resumed to append those numbers once Doer 4 has finished. That lets the benchmark's several minutes of traffic sweeps overlap with the docs work instead of queueing behind it, at the cost of one extra hand-off.
 
 ### Out of scope
 
@@ -288,7 +302,13 @@ Three numbers together, because any one alone misleads — a healthy-looking pac
 
 Most of it needs no vehicle. A separate-process UDP blaster against the loopback adapter drives offered load across roughly 500 / 1,000 / 2,500 / 5,000 / 10,000 / 20,000 pps, thirty seconds per step, recording all three numbers plus the generator's own send count as ground truth. This exercises the whole real stack — Npcap driver, kernel BPF filter, scapy dissection, our callback, `RateWindow.record` — and will surface a callback that is accidentally O(n). Two caveats to record with the results: loopback packet sizes and datalink differ from real Ethernet, and drop accounting may differ from a physical NIC, so absolute numbers do not transfer. It bounds the userspace ceiling, which is the question.
 
-Worth running in the same pass, and cheap: repeat the sweep with the aggregator pre-loaded to 1,000 and 10,000 retained addresses while a 2 Hz poller hits `/api/rates`. Measured snapshot cost is roughly 19 ms at 1,000 addresses and 178 ms at 10,000, held under the same lock the capture callback needs — so lock contention, not scapy's parsing, may well turn out to be the real performance story. Knowing that before anyone reaches for `dpkt` is the point.
+Worth running in the same pass, and cheap: repeat the sweep with the aggregator pre-loaded to 1,000 and 10,000 retained addresses while a 2 Hz poller hits `/api/rates`, since `snapshot()` holds the same lock the capture callback needs.
+
+**Measured, and both estimates it replaces were optimistic.** The capture path sustains **~1,700 packets/second** at ~0.94 of a core, or roughly 550–640 µs of CPU per packet — two to six times the 100–300 µs assumed above, and the reason the ceiling sits where it does. Snapshot stalls came in **four to five times** the earlier standalone estimates once a live capture was competing for the GIL: ~100 ms mean at 1,000 retained addresses against 19 ms estimated, and ~660 ms against 178 ms at 10,000. Retention costs throughput far earlier than the "around 14,000 addresses" figure suggested — a **15% tax at 1,000** addresses and an **88% collapse at 10,000**, where the capture thread's CPU *falls* to 0.10 cores because it is blocked rather than working.
+
+So both effects are real and which dominates depends on retention: at the handful of devices a tether actually carries, **scapy's parsing cost binds** and `dpkt` addresses the right thing; lock contention is a separate, steeper cliff that only opens if address retention runs away.
+
+One caveat that bears directly on the `dpkt` decision: the sweep measures the whole userspace path without attributing cost *within* it. If dissection really is 100–300 µs, something else — scapy's per-packet socket and select loop, or loopback datalink handling — accounts for the rest, and `dpkt` replaces dissection only. **Profile before swapping the parser**, or the fallback may recover much less than the gap implies.
 
 **The `dpkt` trigger, stated before measuring** so the number cannot be rationalized afterwards: swapping parsing to `dpkt` is warranted if, at **twice the observed real-vehicle packet rate**, either `ps_drop / ps_recv` exceeds 0.001 or the capture thread exceeds about half a core. Below that, scapy has adequate headroom and the change is unjustified work. `dpkt` is not currently installed, so this is a real new dependency, not a latent one.
 
@@ -311,10 +331,10 @@ Agent-runnable, by the organizer after each task:
 
 - `pytest` passes, including on a machine without Npcap.
 - `python -m netmon.server --mock` still behaves exactly as it does today: five devices on `192.168.2.0/24`, two on `10.11.12.0/24`, `capture.state` of `mock`, subnet switching and its 400s unaffected.
-- `python -m netmon.server` without `--mock` on this machine, tether connected and vehicle absent, reports `ok` with zero devices — not a crash and not a false failure state.
+- `python -m netmon.server` without `--mock`, with the tether connected and the vehicle absent, reports `ok` with zero devices — not a crash and not a false failure state. **No adapter currently holds `192.168.2.1`**, so until the static address is restored this run correctly reports `interface_missing` instead; the `ok` path is confirmed against an address the machine does hold.
 - With the tether **unplugged**, it reports `interface_missing` and the page shows the warning banner with `detail` naming what to check.
-- `--capture-status` still forces a state for banner review.
-- A deliberately broken callback (test-only, via the injected fake) produces the dead-sniffer state rather than a silently frozen page.
+- `--capture-status` still forces a state for banner review, including `capture_died`.
+- A deliberately broken callback (test-only, via the injected fake) produces `capture_died` rather than a silently frozen page.
 - Use `--port 8765` or similar: `8080` is held by an unrelated `ApplicationWebServer` process on this machine.
 
 For the total-traffic graph specifically, in the browser against `--mock`:

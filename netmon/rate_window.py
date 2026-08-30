@@ -33,8 +33,8 @@ from dataclasses import dataclass
 from typing import Any
 
 MS_PER_SECOND = 1000
-DEFAULT_BUCKET_MS = 250
-DEFAULT_BUCKETS = 40
+DEFAULT_BUCKET_MS = 100
+DEFAULT_BUCKETS = 100
 PPS_DECIMAL_PLACES = 2
 
 Clock = Callable[[], float]
