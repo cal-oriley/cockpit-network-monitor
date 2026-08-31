@@ -1,8 +1,9 @@
 # Packet Capture Feasibility
 
 > Reference material for the capture layer: why the stack is our own read loop
-> over scapy over Npcap, what the kernel filter is and deliberately is not, and
-> the handful of scapy and driver behaviours the design has to work around.
+> over scapy over libpcap (Npcap on Windows, Apple's system libpcap on macOS),
+> what the kernel filter is and deliberately is not, and the handful of scapy
+> and driver behaviours the design has to work around.
 
 This document records the research and the measurements behind the capture
 design, so decisions about it start from evidence rather than a leap of faith.
@@ -32,10 +33,12 @@ Elevation is a third cost only sometimes — see
 Blue Robotics' own setup instructions have the operator assign `192.168.2.1` as
 a **static IP on the topside computer's Ethernet adapter**, with the ROV at
 `192.168.2.2`. So this runs on the operator's laptop, not on the vehicle, which
-is why the host OS matters at all. **Windows** is the only platform capture is
-built for.
+is why the host OS matters at all. Capture is built for **Windows** (Npcap)
+and **macOS** (Apple's system libpcap); see
+[macOS (shipped)](#macos-shipped-linux-not-built) for how the Mac path is
+wired.
 
-## The capture stack: scapy over Npcap
+## The capture stack: scapy over libpcap
 
 Three layers, each owned by someone other than us wherever possible:
 
@@ -44,7 +47,8 @@ netmon/capture.py    reads raw frames via pcap_next_ex, parses the source IP wit
        |
 scapy                opens and configures the socket: filter, promisc=False, immediate delivery
        |
-Npcap                kernel driver, does the actual capturing, one-time installer
+libpcap              kernel-side capture: Npcap on Windows (one-time installer);
+                     Apple's system libpcap on macOS (already present)
        |
 network adapter      packets arriving from the 192.168.2.x subnet
 ```
@@ -436,17 +440,40 @@ answer. They do not transfer as absolute figures for the tether:
   measured at Npcap's ~1 MB default on the loopback adapter; the capture
   requests 8 MB, and a physical adapter's accounting may differ regardless.
 
-## Breadcrumbs for macOS and Linux
+## macOS (shipped); Linux (not built)
 
-Recorded so that porting, if it is ever wanted, starts from research rather
-than scratch. These are
-notes, not stubs — the only code artifact is a platform dispatch that reports
-`unsupported_platform`. Both are easier than Windows, because scapy uses native
-kernel facilities there and **no driver install is needed**.
+macOS was easier than Windows because Apple ships libpcap in the base system
+(`/usr/lib/libpcap.dylib`, version 1.10.1 on the development Mac) and scapy
+already knows how to speak to it. No driver install is needed. The read loop,
+the `struct` parser, the drop-counter reader through `pcap_fd.pcap`, and the
+`_PcapSniffer` class are shared with the Windows path — only socket setup and
+the permission story differ.
 
-- **Linux:** scapy uses `AF_PACKET` natively; needs root or `CAP_NET_RAW`.
-- **macOS:** scapy uses BPF via `/dev/bpf*`; needs root, or membership of the
-  `access_bpf` group that Wireshark's ChmodBPF helper creates.
+The one non-obvious thing is import order. scapy defaults to its **native BPF
+socket** on macOS, and by the time `scapy.all` has finished its architecture
+init, flipping `conf.use_pcap` no longer substitutes `conf.L2listen`. The port
+sets `conf.use_pcap = True` on `scapy.config` **before** importing
+`scapy.all`, from inside the module's lazy `_scapy_conf` — never at module
+scope, so `--mock` and scapy-free tests still work. `_require_pcap` then
+confirms `L2listen` is the libpcap socket class, exactly the assertion the
+Windows path already makes; if it is not, the port raises
+`LibpcapMissingError` instead of `NpcapMissingError` and the state reads as
+`error` rather than the Windows-only `npcap_missing` (macOS has no single
+installer to point at). Note `pcap_setbuff` is Npcap-only and its absence on
+macOS is already swallowed by the `try`/`except` in `_enlarge_kernel_buffer`;
+the loss detection remains the backstop.
+
+`is_elevated()` returns `os.geteuid() == 0` on macOS and is still used only
+to *explain* a permission error that already happened, not to predict one:
+Wireshark's ChmodBPF launch daemon puts the operator in the `access_bpf`
+group that can open `/dev/bpf*` without root, so an up-front check would
+report `needs_elevation` on a Mac that captures fine. The Darwin sentences
+for `NEEDS_ELEVATION_DETAIL` and `ELEVATED_PERMISSION_DETAIL` name `sudo` and
+`access_bpf` rather than Administrator and Npcap.
+
+**Linux** stays research, not code: scapy uses `AF_PACKET` natively; a live
+capture would need root or `CAP_NET_RAW`. The port sets `sys.platform` other
+than `win32` and `darwin` to `unsupported_platform` for now.
 
 ## Why the API carries a capture status
 

@@ -36,9 +36,11 @@ from netmon.capture import (
     CAPTURE_STATE_NPCAP_MISSING,
     CAPTURE_STATE_OK,
     CAPTURE_STATE_UNSUPPORTED_PLATFORM,
+    LIBPCAP_MISSING_DETAIL,
     NPCAP_MISSING_DETAIL,
     CaptureSource,
     CaptureStatus,
+    LibpcapMissingError,
     NpcapMissingError,
     derive_state,
     filter_for,
@@ -236,8 +238,19 @@ class RefusingWindow:
 
 @pytest.fixture
 def on_windows(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Run the lifecycle tests as though this were the target platform."""
+    """Run the lifecycle tests as though this were a Windows target.
+
+    The Windows-flavored copy (`administrator`, `Npcap`) is asserted verbatim,
+    so this fixture stays even on a Mac CI - the alternative is a fork of the
+    lifecycle suite per platform, which was rejected on maintenance grounds.
+    """
     monkeypatch.setattr(capture.sys, "platform", capture.WINDOWS_PLATFORM)
+
+
+@pytest.fixture
+def on_darwin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run the lifecycle tests as though this were a macOS target."""
+    monkeypatch.setattr(capture.sys, "platform", capture.DARWIN_PLATFORM)
 
 
 @pytest.fixture
@@ -570,9 +583,10 @@ def test_state_is_derived_from_the_combination(
 # --------------------------------------------------------------------------
 
 
-def test_capture_off_windows_reports_an_unsupported_platform(
+def test_capture_on_linux_reports_an_unsupported_platform(
     monkeypatch: pytest.MonkeyPatch, window: RateWindow
 ) -> None:
+    """Linux is researched but not built; the gate must not silently open."""
     monkeypatch.setattr(capture.sys, "platform", "linux")
     factory = FakeSnifferFactory()
     source = build_source(window, factory)
@@ -586,11 +600,25 @@ def test_capture_off_windows_reports_an_unsupported_platform(
     assert source.running is False
 
 
-def test_the_pure_logic_still_works_off_windows(
+def test_capture_on_darwin_is_a_supported_platform(
+    on_darwin: None, window: RateWindow
+) -> None:
+    """Darwin must build a sniffer rather than short-circuit at the gate."""
+    factory = FakeSnifferFactory()
+    source = build_source(window, factory)
+
+    source.start()
+    status = source.status()
+
+    assert status.state != CAPTURE_STATE_UNSUPPORTED_PLATFORM
+    assert factory.calls == 1
+
+
+def test_the_pure_logic_still_works_off_supported_platforms(
     monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Nothing at module scope may depend on the platform or on scapy."""
-    monkeypatch.setattr(capture.sys, "platform", "darwin")
+    monkeypatch.setattr(capture.sys, "platform", "linux")
 
     assert filter_for(HOST_IP) == f"ip dst {HOST_IP}"
     assert derive_state(True, None, True) == CAPTURE_STATE_OK
@@ -773,6 +801,49 @@ def test_a_refused_permission_says_something_else_when_already_elevated(
 
     assert status.state == CAPTURE_STATE_NEEDS_ELEVATION
     assert "Npcap" in status.detail
+
+
+def test_a_refused_permission_on_darwin_names_sudo_and_access_bpf(
+    on_darwin: None, monkeypatch: pytest.MonkeyPatch, window: RateWindow
+) -> None:
+    """The macOS remedy is sudo or the access_bpf group, not Administrator."""
+    monkeypatch.setattr(capture, "is_elevated", lambda: False)
+    source = build_source(window, RaisingFactory(OSError(PERMISSION_MESSAGE)))
+
+    source.start()
+    status = source.status()
+
+    assert status.state == CAPTURE_STATE_NEEDS_ELEVATION
+    assert "sudo" in status.detail
+    assert "access_bpf" in status.detail
+    assert "administrator" not in status.detail.lower()
+    assert "Npcap" not in status.detail
+
+
+def test_a_refused_permission_on_darwin_when_root_does_not_mention_npcap(
+    on_darwin: None, monkeypatch: pytest.MonkeyPatch, window: RateWindow
+) -> None:
+    """Root on macOS still failing has nothing to do with a Windows driver."""
+    monkeypatch.setattr(capture, "is_elevated", lambda: True)
+    source = build_source(window, RaisingFactory(OSError(PERMISSION_MESSAGE)))
+
+    source.start()
+    status = source.status()
+
+    assert status.state == CAPTURE_STATE_NEEDS_ELEVATION
+    assert "root" in status.detail
+    assert "Npcap" not in status.detail
+    assert "administrator" not in status.detail.lower()
+
+
+def test_is_elevated_on_darwin_reads_effective_uid(
+    on_darwin: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``os.geteuid() == 0`` is the macOS answer; Windows helpers never run."""
+    monkeypatch.setattr(capture.os, "geteuid", lambda: 0, raising=False)
+    assert capture.is_elevated() is True
+    monkeypatch.setattr(capture.os, "geteuid", lambda: 501, raising=False)
+    assert capture.is_elevated() is False
 
 
 def test_starting_twice_does_not_open_a_second_capture(
@@ -1196,7 +1267,7 @@ def test_a_sniffer_with_no_drop_counters_still_reports_ok(
 
 
 def test_a_scapy_that_will_capture_through_libpcap_is_accepted(
-    monkeypatch: pytest.MonkeyPatch
+    on_windows: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     conf = install_pcap_layer(monkeypatch)
 
@@ -1204,7 +1275,7 @@ def test_a_scapy_that_will_capture_through_libpcap_is_accepted(
 
 
 def test_a_scapy_without_the_libpcap_binding_reports_npcap_missing(
-    monkeypatch: pytest.MonkeyPatch
+    on_windows: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Failing to load pcap at all is exactly the npcap_missing condition."""
 
@@ -1219,7 +1290,7 @@ def test_a_scapy_without_the_libpcap_binding_reports_npcap_missing(
 
 
 def test_a_scapy_that_would_not_use_pcap_reports_npcap_missing(
-    monkeypatch: pytest.MonkeyPatch
+    on_windows: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     install_pcap_layer(monkeypatch, FakeConf(use_pcap=False))
 
@@ -1231,7 +1302,7 @@ def test_a_scapy_that_would_not_use_pcap_reports_npcap_missing(
     "listen_socket", [FakeNativeListenSocket, FakeNativeListenSocket()]
 )
 def test_a_substituted_listen_socket_reports_npcap_missing(
-    monkeypatch: pytest.MonkeyPatch, listen_socket: object
+    on_windows: None, monkeypatch: pytest.MonkeyPatch, listen_socket: object
 ) -> None:
     """``conf.use_pcap`` alone does not prove the socket class came from pcap.
 
@@ -1243,6 +1314,92 @@ def test_a_substituted_listen_socket_reports_npcap_missing(
 
     with pytest.raises(NpcapMissingError):
         capture._require_pcap()
+
+
+def test_a_scapy_without_libpcap_on_darwin_reports_libpcap_missing(
+    on_darwin: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mirror of the npcap_missing test: same condition, macOS sentence."""
+
+    def missing() -> type:
+        raise ImportError("No module named 'scapy.arch.libpcap'")
+
+    install_pcap_layer(monkeypatch)
+    monkeypatch.setattr(capture, "_pcap_listen_socket_class", missing)
+
+    with pytest.raises(LibpcapMissingError, match="libpcap"):
+        capture._require_pcap()
+
+
+def test_a_native_bpf_socket_on_darwin_reports_libpcap_missing(
+    on_darwin: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """scapy defaults to native BPF on macOS; a silent substitution must fail.
+
+    Native BPF cannot be read through the private ``pcap_fd.pcap`` chain the
+    drop-counter and read loop reach for, so a capture that quietly ended up
+    on it would present as working software with no measurable loss and no
+    read loop, which is exactly what the substitution guard exists to catch.
+    """
+    install_pcap_layer(
+        monkeypatch, FakeConf(listen_socket=FakeNativeListenSocket)
+    )
+
+    with pytest.raises(LibpcapMissingError):
+        capture._require_pcap()
+
+
+def test_a_libpcap_missing_on_darwin_reads_through_capture_source_as_error(
+    on_darwin: None, window: RateWindow
+) -> None:
+    """macOS has no single installer to point at, so this is not its own state."""
+    source = build_source(
+        window, RaisingFactory(LibpcapMissingError(LIBPCAP_MISSING_DETAIL))
+    )
+
+    source.start()
+    status = source.status()
+
+    assert status.state == CAPTURE_STATE_ERROR
+    assert "libpcap" in status.detail
+    assert "npcap.com" not in status.detail
+
+
+def test_scapy_conf_on_darwin_forces_use_pcap_before_arch_init(
+    on_darwin: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one truly non-obvious thing in the macOS path.
+
+    ``conf.L2listen`` is resolved by scapy's arch layer as it loads; flipping
+    ``use_pcap`` afterwards no longer substitutes the socket class. The port
+    sets it on ``scapy.config`` before ``scapy.all`` runs, and this test
+    watches that ordering by writing to a fake ``scapy.config`` module before
+    the fake ``scapy.all`` module reads it.
+    """
+    import types
+
+    scapy_pkg = types.ModuleType("scapy")
+    scapy_config = types.ModuleType("scapy.config")
+    scapy_all = types.ModuleType("scapy.all")
+    conf = types.SimpleNamespace(use_pcap=False, seen_use_pcap=None)
+    scapy_config.conf = conf
+
+    def _capture_use_pcap() -> types.SimpleNamespace:
+        conf.seen_use_pcap = conf.use_pcap
+        return conf
+
+    scapy_all.__getattr__ = lambda name: _capture_use_pcap() if name == "conf" else None
+
+    monkeypatch.setitem(sys.modules, "scapy", scapy_pkg)
+    monkeypatch.setitem(sys.modules, "scapy.config", scapy_config)
+    monkeypatch.setitem(sys.modules, "scapy.all", scapy_all)
+
+    result = capture._scapy_conf()
+
+    assert result is conf
+    # arch init ran with use_pcap already set, not flipped afterwards.
+    assert conf.seen_use_pcap is True
+    assert conf.use_pcap is True
 
 
 def test_the_capture_socket_is_opened_without_promiscuous_mode(

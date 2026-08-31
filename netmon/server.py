@@ -118,8 +118,8 @@ CAPTURE_STATE_DETAILS: dict[str, str] = {
     CAPTURE_STATE_OK: "Capturing live traffic.",
     CAPTURE_STATE_MOCK: MOCK_DETAIL,
     CAPTURE_STATE_NEEDS_ELEVATION: (
-        "Packet capture needs Administrator rights; restart this program as an "
-        "administrator."
+        "Packet capture needs elevated rights; restart this program as an "
+        "administrator on Windows or with sudo on macOS."
     ),
     CAPTURE_STATE_NPCAP_MISSING: (
         "Npcap is not installed. Install it from npcap.com, then restart this "
@@ -130,7 +130,7 @@ CAPTURE_STATE_DETAILS: dict[str, str] = {
         "tether is connected and the adapter still holds its static address."
     ),
     CAPTURE_STATE_UNSUPPORTED_PLATFORM: (
-        "Packet capture is only available on Windows in this release."
+        "Packet capture is only available on Windows and macOS in this release."
     ),
     CAPTURE_STATE_NOT_RUNNING: (
         "Packet capture is not running; restart this program to see live "

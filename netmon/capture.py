@@ -26,9 +26,10 @@ Three invariants shape the module, and none of them are obvious:
 * **Liveness is derived, never assumed.** A start confirmation, the stored
   exception and the thread together map onto the capture states - see
   :func:`derive_state`.
-* **A failure is reported, never predicted.** Whether capture needs
-  Administrator rights depends on how Npcap was installed, so elevation is only
-  ever used to *explain* a permission error that actually occurred.
+* **A failure is reported, never predicted.** Whether capture needs elevated
+  rights depends on how Npcap was installed on Windows and on ``access_bpf``
+  membership on macOS, so elevation is only ever used to *explain* a
+  permission error that actually occurred.
 
 scapy is imported lazily, inside the functions that need it: ``--mock`` must
 keep working on a machine without scapy, the pure-logic tests must run without
@@ -37,6 +38,7 @@ it, and ``import scapy.all`` costs seconds of architecture initialisation.
 
 import ctypes
 import ipaddress
+import os
 import socket
 import struct
 import sys
@@ -49,6 +51,10 @@ from typing import Any, Protocol
 from .rate_window import RateWindow
 
 WINDOWS_PLATFORM = "win32"
+DARWIN_PLATFORM = "darwin"
+# Live capture is built for these platforms. Every other value of
+# ``sys.platform`` becomes ``unsupported_platform`` before a socket opens.
+CAPTURE_PLATFORMS = frozenset({WINDOWS_PLATFORM, DARWIN_PLATFORM})
 IPV4_FAMILY = 4
 CAPTURE_FILTER_TEMPLATE = "ip dst {host_ip}"
 PERMISSION_MARKER = "permission"
@@ -65,7 +71,7 @@ DLT_EN10MB = 1
 NULL_HEADER_BYTES = 4
 ETHERNET_HEADER_BYTES = 14
 ETHERTYPE_IPV4 = 0x0800
-AF_INET_HOST_ORDER = 2  # the DLT_NULL family value for IPv4, on Windows
+AF_INET_HOST_ORDER = 2  # the DLT_NULL family value for IPv4 on Windows and macOS
 IPV4_MIN_HEADER_BYTES = 20
 IPV4_SRC_OFFSET = 12  # within the IPv4 header
 IPV4_VERSION = 4
@@ -113,26 +119,47 @@ START_TIMEOUT_DETAIL = (
     "Packet capture did not confirm that it had started within {seconds:g} "
     "seconds, so these rates may not be live."
 )
-NEEDS_ELEVATION_DETAIL = (
+# The permission sentences are platform-specific because the remedy is: on
+# Windows an operator restarts an elevated shell against Npcap, and on macOS
+# they rerun with ``sudo`` or join the ``access_bpf`` group Wireshark installs.
+# One sentence would be wrong on both machines, so ``_needs_elevation_detail``
+# picks the right one from ``sys.platform`` at status time rather than baking
+# either into the module.
+NEEDS_ELEVATION_DETAIL_WINDOWS = (
     "Windows refused permission to capture packets. Restart this program as an "
     "administrator."
 )
-ELEVATED_PERMISSION_DETAIL = (
+NEEDS_ELEVATION_DETAIL_DARWIN = (
+    "macOS refused permission to capture packets. Rerun this program with "
+    "sudo, or install Wireshark so its ChmodBPF helper puts you in the "
+    "access_bpf group that can open /dev/bpf*."
+)
+ELEVATED_PERMISSION_DETAIL_WINDOWS = (
     "Windows refused permission to capture packets even though this program is "
     "already running as an administrator. Check that Npcap is installed and "
     "that its driver is running."
 )
+ELEVATED_PERMISSION_DETAIL_DARWIN = (
+    "macOS refused permission to capture packets even though this program is "
+    "already running as root. Check that /dev/bpf* is readable and that the "
+    "tether adapter is up."
+)
 NPCAP_MISSING_DETAIL = (
     "Npcap is not installed, so live packet capture is unavailable. Install it "
     "from npcap.com and restart this program."
+)
+LIBPCAP_MISSING_DETAIL = (
+    "libpcap is not available, so live packet capture is unavailable. macOS "
+    "ships libpcap in /usr/lib/libpcap.dylib; if it is missing, install it "
+    "(e.g. `brew install libpcap`) and restart this program."
 )
 INTERFACE_MISSING_DETAIL = (
     "No network adapter is using {host_ip}. Check that the tether is plugged in "
     "and that the adapter still holds that static address."
 )
 UNSUPPORTED_PLATFORM_DETAIL = (
-    "Live packet capture is only available on Windows; this machine reports "
-    "{platform}."
+    "Live packet capture is only available on Windows and macOS; this machine "
+    "reports {platform}."
 )
 ERROR_DETAIL = "Packet capture failed: {message}"
 
@@ -151,7 +178,21 @@ class CaptureStatus:
 
 
 class NpcapMissingError(RuntimeError):
-    """scapy is importable but cannot capture through libpcap/Npcap."""
+    """scapy is importable but cannot capture through Npcap on Windows.
+
+    The Windows-only sibling of :class:`LibpcapMissingError`: kept distinct so
+    the state derivation can point Windows operators at npcap.com without
+    conflating the two OSes' failure modes.
+    """
+
+
+class LibpcapMissingError(RuntimeError):
+    """scapy is importable but cannot capture through libpcap on macOS.
+
+    macOS ships libpcap by default, so this is genuinely unusual and reads
+    through :func:`_status_from_exception` as ``error`` rather than a state
+    of its own - unlike Windows, there is no single install to point at.
+    """
 
 
 class Sniffer(Protocol):
@@ -330,21 +371,46 @@ def is_losing_packets(received: int, counted: int) -> bool:
 
 
 def is_elevated() -> bool:
-    """Whether this process holds Administrator rights.
+    """Whether this process holds Administrator (Windows) or root (macOS) rights.
 
-    Used only to *explain* a permission failure that has already happened.
-    Npcap can be installed without its admin-only restriction, in which case an
-    unelevated capture works perfectly and an up-front check would report
-    ``needs_elevation`` on a machine that captures fine.
+    Used only to *explain* a permission failure that has already happened. On
+    Windows, Npcap can be installed without its admin-only restriction; on
+    macOS the ``access_bpf`` group (installed by Wireshark's ChmodBPF helper)
+    can grant capture without root - so in both cases an up-front check would
+    report ``needs_elevation`` on a machine that captures fine.
     """
+    if sys.platform == DARWIN_PLATFORM:
+        # ``os.geteuid`` is absent on Windows, so guard even though this branch
+        # will only ever run there.
+        geteuid = getattr(os, "geteuid", None)
+        if geteuid is None:
+            return False
+        return geteuid() == 0
     try:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:
         return False
 
 
+def _needs_elevation_detail() -> str:
+    """Platform-specific sentence for a refused permission this process cannot fix."""
+    if sys.platform == DARWIN_PLATFORM:
+        return NEEDS_ELEVATION_DETAIL_DARWIN
+    return NEEDS_ELEVATION_DETAIL_WINDOWS
+
+
+def _elevated_permission_detail() -> str:
+    """Platform-specific sentence for a refused permission after elevation."""
+    if sys.platform == DARWIN_PLATFORM:
+        return ELEVATED_PERMISSION_DETAIL_DARWIN
+    return ELEVATED_PERMISSION_DETAIL_WINDOWS
+
+
 class CaptureSource:
-    """Passive scapy/Npcap listener feeding :meth:`RateWindow.record`.
+    """Passive libpcap listener feeding :meth:`RateWindow.record`.
+
+    Uses scapy over Npcap on Windows and scapy over Apple's system libpcap on
+    macOS: the sniffer, read loop and drop-counter reads are the same on both.
 
     :meth:`start`, :meth:`stop` and :attr:`running` mirror ``MockSource`` so the
     server can treat the two sources interchangeably, and neither start nor stop
@@ -391,13 +457,13 @@ class CaptureSource:
 
         The server starts its source inside its own startup path, where a
         monitor that refuses to run is far less useful than one that runs and
-        says why it cannot see anything - so a wrong platform, a missing Npcap,
-        a missing adapter or a refused permission all become states instead of
-        exceptions. Calling this twice is a no-op.
+        says why it cannot see anything - so a wrong platform, a missing pcap
+        backend, a missing adapter or a refused permission all become states
+        instead of exceptions. Calling this twice is a no-op.
         """
         if self._sniffer is not None or self._failure is not None:
             return
-        if sys.platform != WINDOWS_PLATFORM:
+        if sys.platform not in CAPTURE_PLATFORMS:
             self._failure = CaptureStatus(
                 CAPTURE_STATE_UNSUPPORTED_PLATFORM,
                 UNSUPPORTED_PLATFORM_DETAIL.format(platform=sys.platform),
@@ -423,6 +489,13 @@ class CaptureSource:
             sniffer.start()
         except NpcapMissingError as error:
             self._failure = CaptureStatus(CAPTURE_STATE_NPCAP_MISSING, str(error))
+            return
+        except LibpcapMissingError as error:
+            # macOS ships libpcap, so its absence is not a state of its own
+            # the way Npcap's is on Windows - there is no single installer to
+            # point at. It reads as ``error`` and the UI banner shows the
+            # sentence verbatim.
+            self._failure = CaptureStatus(CAPTURE_STATE_ERROR, str(error))
             return
         except Exception as error:
             self._failure = _status_from_exception(error)
@@ -707,7 +780,20 @@ class _PcapSniffer:
 
 
 def _scapy_conf() -> Any:
-    """scapy's configuration object, imported lazily."""
+    """scapy's configuration object, imported lazily.
+
+    On macOS scapy defaults to its native BPF socket rather than libpcap, and
+    the flag has to be set on ``scapy.config`` *before* ``scapy.all`` runs its
+    architecture init - once the arch layer has resolved ``conf.L2listen`` and
+    ``scapy.arch.libpcap`` has been loaded, flipping ``use_pcap`` no longer
+    substitutes the socket class. Doing it here keeps that seam in one place,
+    and this module already ships all its scapy imports lazily so the extra
+    pre-import costs nothing on a machine that never opens a capture.
+    """
+    if sys.platform == DARWIN_PLATFORM:
+        from scapy.config import conf as pre_arch_conf
+
+        pre_arch_conf.use_pcap = True
     from scapy.all import conf
 
     return conf
@@ -716,35 +802,52 @@ def _scapy_conf() -> Any:
 def _pcap_listen_socket_class() -> type:
     """scapy's libpcap listen-socket class, imported lazily.
 
-    Its absence means scapy has no libpcap binding at all, which is one of the
-    two ways :func:`_require_pcap` recognises a missing Npcap.
+    Its absence means scapy has no libpcap binding at all, which is how
+    :func:`_require_pcap` recognises a missing Npcap on Windows and a missing
+    system libpcap on macOS.
     """
     from scapy.arch.libpcap import L2pcapListenSocket
 
     return L2pcapListenSocket
 
 
+def _pcap_missing_error() -> RuntimeError:
+    """The right ``pcap is missing`` exception for this platform.
+
+    Distinct types because the two failures have different remedies and
+    different states: Windows has one installer at npcap.com and gets its own
+    ``npcap_missing`` state; macOS ships libpcap in the base system, so a
+    missing one is unusual and reads as ``error`` with a libpcap sentence.
+    """
+    if sys.platform == DARWIN_PLATFORM:
+        return LibpcapMissingError(LIBPCAP_MISSING_DETAIL)
+    return NpcapMissingError(NPCAP_MISSING_DETAIL)
+
+
 def _require_pcap() -> Any:
     """Return scapy's config, having confirmed it will capture via libpcap.
 
     ``conf.use_pcap`` must be read *after* importing ``scapy.all``: read from
-    ``scapy.config`` alone it is ``False`` simply because the architecture
-    layer has not initialised yet. The listen-socket class is checked too,
-    because the flag alone does not prove the class was substituted - and
-    scapy's own Windows socket cannot see incoming TCP at all, so a silent
-    substitution would look like a working capture that sees almost nothing.
+    ``scapy.config`` alone it is ``False`` on Windows simply because the
+    architecture layer has not initialised yet. The listen-socket class is
+    checked too, because the flag alone does not prove the class was
+    substituted - and scapy's own Windows socket cannot see incoming TCP at
+    all, so a silent substitution would look like a working capture that sees
+    almost nothing. On macOS the same check catches the mirror-image failure:
+    if libpcap could not be loaded, scapy leaves ``L2listen`` as its native
+    BPF socket rather than the libpcap one.
     """
     conf = _scapy_conf()
     try:
         pcap_listen_socket = _pcap_listen_socket_class()
     except ImportError as error:
-        raise NpcapMissingError(NPCAP_MISSING_DETAIL) from error
+        raise _pcap_missing_error() from error
     listen_socket = conf.L2listen
     if not conf.use_pcap or not (
         isinstance(listen_socket, type)
         and issubclass(listen_socket, pcap_listen_socket)
     ):
-        raise NpcapMissingError(NPCAP_MISSING_DETAIL)
+        raise _pcap_missing_error()
     return conf
 
 
@@ -788,7 +891,9 @@ def _status_from_exception(error: BaseException) -> CaptureStatus:
     state = derive_state(started=False, exception=error, thread_alive=False)
     if state == CAPTURE_STATE_NEEDS_ELEVATION:
         detail = (
-            ELEVATED_PERMISSION_DETAIL if is_elevated() else NEEDS_ELEVATION_DETAIL
+            _elevated_permission_detail()
+            if is_elevated()
+            else _needs_elevation_detail()
         )
         return CaptureStatus(state, detail)
     return CaptureStatus(state, ERROR_DETAIL.format(message=error))

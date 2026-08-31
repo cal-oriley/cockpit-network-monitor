@@ -5,8 +5,10 @@
 # upgrade a decision rather than a surprise.
 scapy>=2.7.0,<2.8
 #
-# Npcap is a prerequisite, not a pip dependency: it is a Windows system driver,
-# installed separately from npcap.com.
+# A pcap backend is a prerequisite, not a pip dependency:
+#   - Windows: Npcap, installed separately from npcap.com.
+#   - macOS:   the system libpcap at /usr/lib/libpcap.dylib, which ships with
+#              the base OS.
 #
 # Development / test only:
 pytest

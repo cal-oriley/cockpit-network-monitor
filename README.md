@@ -17,15 +17,25 @@ to the tether, is not in the packet path, and needs no promiscuous mode.
 
 ## Requirements
 
-- **Windows**, for live capture.
-- **[Npcap](https://npcap.com)**, the packet-capture driver Wireshark installs
-  on Windows. Install it from [npcap.com](https://npcap.com) — it is a system
-  driver, not a pip package.
+- **Windows or macOS**, for live capture. Linux reports
+  `unsupported_platform`.
+- **A pcap backend**:
+  - **Windows** — **[Npcap](https://npcap.com)**, the packet-capture driver
+    Wireshark installs on Windows. Install it from
+    [npcap.com](https://npcap.com) — it is a system driver, not a pip package.
+  - **macOS** — the **system libpcap** at `/usr/lib/libpcap.dylib`, which
+    ships with the base OS. No install needed on a normal Mac.
 - **scapy**, from `requirements.txt`.
 
-Whether capture needs an elevated (Administrator) terminal depends on how Npcap
-was installed. Run unelevated first: a refused permission is reported in the
-page, which will say to restart as an administrator.
+Whether capture needs elevated rights depends on the machine.
+
+- **Windows.** Whether an Administrator terminal is needed depends on how
+  Npcap was installed. Run unelevated first: a refused permission is reported
+  in the page, which will say to restart as an administrator.
+- **macOS.** Capture opens `/dev/bpf*`, which needs `sudo` or membership of
+  the `access_bpf` group that Wireshark's ChmodBPF launch daemon creates.
+  Run unelevated first: a refused permission is reported in the page and
+  names the two options.
 
 ## Quickstart
 
@@ -36,8 +46,8 @@ python -m netmon.server
 
 Then open <http://localhost:8080>.
 
-To review the page with no tether, no vehicle, and no Npcap, feed it synthetic
-traffic instead:
+To review the page with no tether, no vehicle, and no pcap backend, feed it
+synthetic traffic instead:
 
 ```
 python -m netmon.server --mock
@@ -66,12 +76,12 @@ python -m netmon.server --port 8765
 
 ## Capture status
 
-Anything that stops capture working — Npcap absent, no adapter holding
-`--host-ip`, a refused permission, a capture that died after starting — is
-reported as a banner across the top of the page, naming what to check, with the
-device rows left readable. The server does not exit on a capture failure, and
-`--capture-status` forces a state so the banner can be reviewed without
-reproducing the condition.
+Anything that stops capture working — Npcap or system libpcap absent, no
+adapter holding `--host-ip`, a refused permission, a capture that died after
+starting — is reported as a banner across the top of the page, naming what to
+check, with the device rows left readable. The server does not exit on a
+capture failure, and `--capture-status` forces a state so the banner can be
+reviewed without reproducing the condition.
 
 ## Recording
 
@@ -101,5 +111,6 @@ pytest
 ## Further reading
 
 - [Packet capture feasibility](docs/capture-feasibility.md) — the capture
-  research: scapy over Npcap, why a stdlib raw socket was rejected, the BPF
-  filter, licensing, and measured throughput.
+  research: scapy over Npcap on Windows and scapy over system libpcap on
+  macOS, why a stdlib raw socket was rejected, the BPF filter, licensing, and
+  measured throughput.
