@@ -1,7 +1,8 @@
 /*
  * The canvas traces: the palette they are inked from, the series arithmetic
- * behind them, the drawing itself, and the observer that keeps both the
- * canvases and the axis correct as the panel is resized.
+ * behind them, the drawing itself, the clock that slides a bucket-aligned
+ * series between samples, and the observer that keeps both the canvases and
+ * the axis correct as the panel is resized.
  */
 
 import {
@@ -30,6 +31,101 @@ function readPalette() {
 
 /* Canvas colours live in style.css so the palette has a single home. */
 const PALETTE = readPalette();
+
+/* Rise with a new peak at once; ease down so a spike leaving the window
+   does not yank the whole trace vertically. */
+const SCALE_DOWN = 0.04;
+
+/** @type {Set<object>} Views the graph clock paints. */
+const liveViews = new Set();
+
+let sampleBucketMs = 0;
+let scrollPhase = 0;
+let phaseOriginPerf = 0;
+let rafId = 0;
+
+/**
+ * How far the strip has moved through the current bucket, 0..1.
+ *
+ * The clock is local. A pending sample is held until this wraps, so the
+ * series only shifts when the draw has already slid one full bucket.
+ */
+export function phaseThroughBucket(elapsedMs, bucketMs, hasPending) {
+  if (!(bucketMs > 0) || elapsedMs <= 0) return 0;
+  if (elapsedMs >= bucketMs && !hasPending) return 1;
+  return (elapsedMs % bucketMs) / bucketMs;
+}
+
+/**
+ * Queue a series so the clock can swap it at a wrap, or show it at once
+ * when the card has nothing to scroll yet.
+ */
+export function adoptSeries(view, series, peakPps) {
+  if (view.series.length === 0) {
+    view.series = series;
+    view.peakPps = peakPps;
+    return;
+  }
+  view.pendingSeries = series;
+  view.pendingPeak = peakPps;
+}
+
+export function adoptTimeline(nowMs, bucketMs) {
+  sampleBucketMs = numberOr(bucketMs, 0);
+  if (phaseOriginPerf === 0) phaseOriginPerf = performance.now();
+  ensureAnimating();
+}
+
+function hasPending() {
+  for (const view of liveViews) {
+    if (view.pendingSeries) return true;
+  }
+  return false;
+}
+
+function commitPending() {
+  let committed = false;
+  for (const view of liveViews) {
+    if (!view.pendingSeries) continue;
+    view.series = view.pendingSeries;
+    view.peakPps = view.pendingPeak;
+    view.pendingSeries = null;
+    committed = true;
+  }
+  return committed;
+}
+
+function stepClock(now) {
+  if (sampleBucketMs <= 0) {
+    scrollPhase = 0;
+    return;
+  }
+  if (phaseOriginPerf === 0) phaseOriginPerf = now;
+  let elapsed = now - phaseOriginPerf;
+  /* One series is queued, the latest. Swap it at a wrap and restart the
+     phase so the last frame at 1 and the first frame of the new series at 0
+     draw the same pixels. */
+  if (elapsed >= sampleBucketMs && commitPending()) {
+    phaseOriginPerf = now;
+    elapsed = 0;
+  }
+  scrollPhase = phaseThroughBucket(elapsed, sampleBucketMs, hasPending());
+}
+
+function ensureAnimating() {
+  if (rafId || liveViews.size === 0) return;
+  rafId = requestAnimationFrame(paintGraphs);
+}
+
+function paintGraphs(now) {
+  if (liveViews.size === 0) {
+    rafId = 0;
+    return;
+  }
+  rafId = requestAnimationFrame(paintGraphs);
+  stepClock(now);
+  for (const view of liveViews) drawGraph(view);
+}
 
 /* How a card's trace is inked. The total gets its own accent and a heavier
    line so a glance never mistakes it for one more device. */
@@ -123,15 +219,23 @@ export function drawGraph(view) {
   const series = view.series;
   if (series.length === 0) return;
 
-  const scale = Math.max(view.peakPps, MIN_Y_SCALE_PPS);
+  const targetScale = Math.max(view.peakPps, MIN_Y_SCALE_PPS);
+  if (view.displayPeak === undefined || targetScale > view.displayPeak) {
+    view.displayPeak = targetScale;
+  } else {
+    view.displayPeak += (targetScale - view.displayPeak) * SCALE_DOWN;
+  }
+  const scale = Math.max(view.displayPeak, MIN_Y_SCALE_PPS);
   const plotHeight = Math.max(1, cssHeight - GRAPH_TOP_PAD_PX - GRAPH_LINE_WIDTH_PX);
   const stepX = (lastX - firstX) / (series.length - 1);
-  const xAt = (index) => firstX + index * stepX;
+  const xAt = (index) => firstX + (index - scrollPhase) * stepX;
   const yAt = (value) => baselineY - Math.min(value / scale, 1) * plotHeight;
+  const lastY = yAt(series[series.length - 1]);
 
   ctx.beginPath();
-  ctx.moveTo(firstX, baselineY);
+  ctx.moveTo(xAt(0), baselineY);
   for (let i = 0; i < series.length; i += 1) ctx.lineTo(xAt(i), yAt(series[i]));
+  ctx.lineTo(lastX, lastY);
   ctx.lineTo(lastX, baselineY);
   ctx.closePath();
   ctx.fillStyle = view.stale ? PALETTE.staleFill : view.style.fill;
@@ -144,6 +248,7 @@ export function drawGraph(view) {
     if (i === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
   }
+  if (xAt(series.length - 1) < lastX) ctx.lineTo(lastX, lastY);
   ctx.lineWidth = view.style.lineWidth;
   ctx.strokeStyle = view.stale ? PALETTE.staleLine : view.style.line;
   ctx.stroke();
@@ -170,10 +275,13 @@ resizeObserver.observe(els.axis);
 
 export function observeCanvas(view) {
   canvasOwners.set(view.canvas, view);
+  liveViews.add(view);
   resizeObserver.observe(view.canvas);
+  ensureAnimating();
 }
 
 export function unobserveCanvas(view) {
   resizeObserver.unobserve(view.canvas);
   canvasOwners.delete(view.canvas);
+  liveViews.delete(view);
 }

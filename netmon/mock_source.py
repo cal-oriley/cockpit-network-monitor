@@ -78,7 +78,7 @@ class MockDevice:
 def _stochastic_round(value: float, rng: random.Random) -> int:
     """Round to an integer, treating the fraction as a probability.
 
-    A 5 pps device owes 1.25 packets per 250 ms bucket; truncating would peg it
+    A 5 pps device owes 0.5 packets per 100 ms bucket; truncating would peg it
     at a flat 4 pps forever, so the fractional part decides a coin flip and the
     long-run average comes out right.
     """

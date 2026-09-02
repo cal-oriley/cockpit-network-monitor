@@ -11,7 +11,7 @@ import { numberOr } from './format.js';
 import {
   GRAPH_STYLE_DEVICE,
   GRAPH_STYLE_TOTAL,
-  drawGraph,
+  adoptSeries,
   normalizeSeries,
   observeCanvas,
   sumSeries,
@@ -102,14 +102,18 @@ function createTotalView() {
 }
 
 /**
- * Every poll redraws, whatever the numbers say. A silent device's window
- * still scrolls, so staleness only dims the row and reveals its badge - it
- * never pauses the drawing that carries the trace along the baseline.
+ * Every poll updates the series; the graph clock paints it. A silent
+ * device's window still scrolls, so staleness only dims the row and reveals
+ * its badge - it never pauses the drawing that carries the trace along the
+ * baseline.
  */
 function updateRowView(view, device) {
   const currentPps = numberOr(device.current_pps, 0);
-  view.series = normalizeSeries(device.pps);
-  view.peakPps = Math.max(0, numberOr(device.peak_pps, 0));
+  adoptSeries(
+    view,
+    normalizeSeries(device.pps),
+    Math.max(0, numberOr(device.peak_pps, 0)),
+  );
   view.stale = numberOr(device.idle_ms, 0) >= STALE_IDLE_MS;
 
   view.element.dataset.stale = String(view.stale);
@@ -119,8 +123,6 @@ function updateRowView(view, device) {
     'aria-label',
     view.stale ? TEXT.graphLabelStale(view.ip) : TEXT.graphLabel(view.ip, currentPps),
   );
-
-  drawGraph(view);
 }
 
 /**
@@ -137,14 +139,16 @@ function updateTotalView(view, devices) {
     (total, device) => total + Math.max(0, numberOr(device.current_pps, 0)),
     0,
   );
-  view.series = normalizeSeries(sumSeries(devices));
-  view.peakPps = view.series.reduce((peak, value) => Math.max(peak, value), 0);
+  const series = normalizeSeries(sumSeries(devices));
+  adoptSeries(
+    view,
+    series,
+    series.reduce((peak, value) => Math.max(peak, value), 0),
+  );
 
   view.rateEl.textContent = TEXT.rate(currentPps);
   view.peakEl.textContent = TEXT.peak(view.peakPps);
   view.canvas.setAttribute('aria-label', TEXT.totalGraphLabel(currentPps));
-
-  drawGraph(view);
 }
 
 function destroyCardView(view) {

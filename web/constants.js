@@ -11,7 +11,7 @@ import { formatRate, formatSeconds } from './format.js';
 export const RATES_URL = 'api/rates';
 export const RECORD_URL = 'api/record';
 
-export const POLL_INTERVAL_MS = 500;
+export const POLL_INTERVAL_MS = 100;
 export const IMMEDIATE_POLL_MS = 0;
 export const MAX_BACKOFF_MS = 2000;
 export const BACKOFF_FACTOR = 2;
