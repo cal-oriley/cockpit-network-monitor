@@ -459,6 +459,7 @@ body {
 .row-graph {
   height: var(--graph-h);
   min-width: 0;
+  overflow: hidden;
 }
 
 .row-graph canvas {

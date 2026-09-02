@@ -11,7 +11,9 @@ all three share lives in ``conftest``.
 
 import urllib.request
 from http import HTTPStatus
+from http.client import HTTPConnection
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -32,6 +34,7 @@ from netmon.server import (
     DEFAULT_SUBNET,
     JSON_CONTENT_TYPE,
     NO_STORE,
+    RATES_PATH,
     UNKNOWN_CAPTURE_DETAIL,
     capture_status_for,
     capture_status_reader,
@@ -239,6 +242,36 @@ def test_omitting_the_parameter_serves_the_default_subnet(clock: FakeClock) -> N
         len(device["pps"]) == response.body["buckets"]
         for device in response.body["devices"]
     )
+
+
+def test_polls_reuse_one_connection(clock: FakeClock) -> None:
+    """The regression guard for an HTTP/1.0 handler.
+
+    Closing the connection after every response makes the page open a new one
+    ten times a second. Measured from inside a Cockpit panel that cost ~126 ms
+    per poll against ~3 ms reused, which starved the graphs of the samples
+    they interpolate between and made the traces lurch rather than creep.
+    A reused socket keeps its local port, so the ports are the assertion.
+    """
+    with serving(populated_window(clock)) as base_url:
+        address = urlsplit(base_url)
+        connection = HTTPConnection(
+            address.hostname, address.port, timeout=REQUEST_TIMEOUT_S
+        )
+        try:
+            local_ports = []
+            for _ in range(3):
+                connection.request("GET", RATES_PATH)
+                response = connection.getresponse()
+                response.read()
+                assert response.status == HTTPStatus.OK
+                assert response.version == 11
+                assert connection.sock is not None, "server hung up after a poll"
+                local_ports.append(connection.sock.getsockname()[1])
+        finally:
+            connection.close()
+
+    assert len(set(local_ports)) == 1
 
 
 def test_the_payload_carries_exactly_the_documented_keys(clock: FakeClock) -> None:

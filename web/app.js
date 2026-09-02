@@ -3,7 +3,7 @@
  *
  * The server owns the rolling window, so this page holds no history: every poll
  * carries a complete, bucket-aligned series per device. The graph clock slides
- * those samples across the canvas between buckets so the traces scroll with
+ * those samples across the canvas between buckets so the traces creep with
  * time instead of jumping once per sample. Rows are reconciled by IP rather
  * than rebuilt, so only the rows that actually appear or leave touch the DOM
  * and the rest never flicker or reorder under the cursor. Heading them is the
@@ -52,6 +52,8 @@ function applyPayload(payload) {
      one this payload was filtered to rather than the previous poll's. */
   applyRecordingStatus(payload.recording);
   renderAxis(readWindowMs(payload));
+  /* Timeline first so a new bucket is known before the series are queued. */
+  adoptTimeline(payload.now_ms, payload.bucket_ms);
   /* An empty list is a real answer - nothing has been seen yet, or nothing in
      this subnet - and empties the grid accordingly. A `devices` that is
      missing or not a list is instead a payload this page cannot read, so the
@@ -59,13 +61,11 @@ function applyPayload(payload) {
   if (Array.isArray(payload.devices)) {
     updateHeader(payload, reconcileRows(payload.devices));
   }
-  /* After the series, so the first paint of a new bucket already has both
-     the samples and the time they belong to. */
-  adoptTimeline(payload.now_ms, payload.bucket_ms);
 }
 
 async function pollOnce() {
   const subnet = getRequestedSubnet();
+  const startedAt = performance.now();
   try {
     const result = await fetchRates(subnet);
     /* A commit landed mid-flight, so this answer describes the previous
@@ -94,7 +94,12 @@ async function pollOnce() {
     setConnection(CONNECTION_DISCONNECTED);
     nextDelayMs = Math.min(nextDelayMs * BACKOFF_FACTOR, MAX_BACKOFF_MS);
   }
-  scheduleNextPoll(nextDelayMs);
+  /* Measured from the poll's start, not its answer, so the request's own cost
+     does not push the next one later. Sleeping a full interval after every
+     answer polls slower than the server fills buckets, and a bucket missed
+     that way arrives as two at once - which the graph can only show as a
+     lurch. */
+  scheduleNextPoll(Math.max(0, nextDelayMs - (performance.now() - startedAt)));
 }
 
 function scheduleNextPoll(delayMs) {
