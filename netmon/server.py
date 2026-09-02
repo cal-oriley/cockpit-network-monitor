@@ -255,7 +255,19 @@ class UnreadBodyError(ValueError):
 
 
 class RatesRequestHandler(SimpleHTTPRequestHandler):
-    """Serves the ``web/`` directory, intercepting the rates endpoint."""
+    """Serves the ``web/`` directory, intercepting the rates endpoint.
+
+    Keep-alive is not a micro-optimisation here, it is what makes a 10 Hz poll
+    viable. The base class defaults to HTTP/1.0, which closes the connection
+    after every response and makes the page pay for a fresh one ten times a
+    second; measured from inside a Cockpit panel that cost ~126 ms per poll,
+    so the traces advanced in visible jerks of two or more buckets instead of
+    creeping. Every response this handler can produce carries an accurate
+    ``Content-Length`` - JSON bodies here, static files and errors in the base
+    class - which is what HTTP/1.1 requires to reuse a connection.
+    """
+
+    protocol_version = "HTTP/1.1"
 
     def __init__(
         self,
@@ -281,6 +293,11 @@ class RatesRequestHandler(SimpleHTTPRequestHandler):
             self._send_rates()
             return
         super().do_GET()
+
+    def end_headers(self) -> None:
+        """Do not cache the page: an iframe (Cockpit) otherwise keeps a stale graph.js."""
+        self.send_header("Cache-Control", NO_STORE)
+        super().end_headers()
 
     def do_POST(self) -> None:
         if urlsplit(self.path).path == RECORD_PATH:
@@ -435,7 +452,6 @@ class RatesRequestHandler(SimpleHTTPRequestHandler):
             self.send_response(status)
             self.send_header("Content-Type", JSON_CONTENT_TYPE)
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", NO_STORE)
             if close:
                 # http.server derives ``close_connection`` from this header
                 # itself, so what is announced and what happens cannot drift.
