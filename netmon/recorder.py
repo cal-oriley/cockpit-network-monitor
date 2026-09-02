@@ -11,8 +11,8 @@ The obvious implementation appends a row whenever a poll arrives, and it is
 wrong twice over. Polls are not guaranteed: closing, backgrounding or
 disconnecting the browser stops them, and a recording that quietly stops
 collecting is only discovered afterwards, from a file that is too short. Poll
-timing also does not align with buckets: a 500 ms poll against 250 ms buckets
-sees two new buckets most times, but three, one, or the same one twice under
+timing also does not align with buckets: a 100 ms poll against 100 ms buckets
+sees one new bucket most times, but two, none, or the same one twice under
 jitter, a slow request or a retry - so rows would duplicate or vanish according
 to network timing.
 

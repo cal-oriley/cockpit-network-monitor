@@ -3,7 +3,7 @@
 ponytail: the whole web stack is the standard library's
 :class:`~http.server.ThreadingHTTPServer`. Ceiling - request/response only, so
 no server push (SSE or WebSocket), no async, and one thread per connection,
-which a 2 Hz poll from a handful of browser tabs does not strain. Upgrade path
+which a 10 Hz poll from a handful of browser tabs does not strain. Upgrade path
 - if push updates are ever wanted, drop in FastAPI + uvicorn behind the same
 ``/api/rates`` shape.
 """
@@ -47,6 +47,10 @@ DEFAULT_PORT = 8080
 DEFAULT_BIND_HOST = "0.0.0.0"
 DEFAULT_HOST_IP = "192.168.2.1"
 DEFAULT_SUBNET = "192.168.2.0/24"
+# Bind-all addresses are not destinations. A browser asked for 0.0.0.0 or ::
+# refuses the connection, which reads as the page not being served.
+UNSPECIFIED_BIND_HOSTS = frozenset({"0.0.0.0", "::"})
+BROWSE_HOST = "localhost"
 
 RATES_PATH = "/api/rates"
 RECORD_PATH = "/api/record"
@@ -148,6 +152,20 @@ CAPTURE_STATE_DETAILS: dict[str, str] = {
 }
 
 UNKNOWN_CAPTURE_DETAIL = "Packet capture reported an unrecognised state: {state}."
+
+
+def browse_url(host: str, port: int) -> str:
+    """The URL an operator can open for this bind.
+
+    ``0.0.0.0`` and ``::`` mean every interface, not a host. Printing them as
+    the served address is what makes a running server look like it is serving
+    nothing: the browser refuses the connection.
+    """
+    if host in UNSPECIFIED_BIND_HOSTS:
+        host = BROWSE_HOST
+    elif ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"http://{host}:{port}/"
 
 
 def capture_status_for(state: str) -> CaptureStatus:
@@ -271,7 +289,7 @@ class RatesRequestHandler(SimpleHTTPRequestHandler):
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def log_message(self, format: str, *args: Any) -> None:
-        """Stay quiet: a 2 Hz poll would otherwise flood the console."""
+        """Stay quiet: a 10 Hz poll would otherwise flood the console."""
 
     def _send_rates(self) -> None:
         """Answer one poll, narrowed to the subnet it asked for.
@@ -565,7 +583,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # the source actually reached, not the one it held before opening.
         source.start()
         print(
-            f"Serving on http://{args.host}:{args.port}/ "
+            f"Serving on {browse_url(args.host, args.port)} "
             f"(capture: {read_capture_status().state}, subnet: {default_subnet})",
             flush=True,
         )

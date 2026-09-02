@@ -40,6 +40,7 @@ from netmon.server import (
     DEFAULT_SUBNET,
     EXCLUSIVE_PORTS_AVAILABLE,
     ExclusivePortHTTPServer,
+    browse_url,
     build_parser,
     build_source,
     capture_status_for,
@@ -190,6 +191,35 @@ def free_loopback_port() -> int:
     with socket.socket() as probe:
         probe.bind((LOOPBACK, EPHEMERAL_PORT))
         return probe.getsockname()[1]
+
+
+@pytest.mark.parametrize(
+    "host,port,url",
+    [
+        ("0.0.0.0", 8765, "http://localhost:8765/"),
+        ("::", 8765, "http://localhost:8765/"),
+        ("127.0.0.1", 8765, "http://127.0.0.1:8765/"),
+        ("192.168.2.1", 8080, "http://192.168.2.1:8080/"),
+        ("::1", 8765, "http://[::1]:8765/"),
+        ("[::1]", 8765, "http://[::1]:8765/"),
+    ],
+)
+def test_browse_url_is_a_destination_the_browser_can_open(
+    host: str, port: int, url: str
+) -> None:
+    assert browse_url(host, port) == url
+
+
+def test_startup_banner_names_localhost_not_the_bind_all_address(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    recording_sources(monkeypatch)
+
+    run_main(monkeypatch, ["--port", "8765"])
+    out = capsys.readouterr().out
+
+    assert "http://localhost:8765/" in out
+    assert "http://0.0.0.0:" not in out
 
 
 def test_cli_defaults_match_the_documented_ones() -> None:

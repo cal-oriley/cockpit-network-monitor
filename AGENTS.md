@@ -43,7 +43,7 @@ as every device flatlining.
 Interchangeable with the capture source: both expose
 `start`/`stop`/`running`/`status`.
 - `netmon/server.py` — stdlib `ThreadingHTTPServer` serving the `web/` directory
-plus a `GET /api/rates` JSON endpoint, polled at 2 Hz by the browser. Owns
+plus a `GET /api/rates` JSON endpoint, polled at 10 Hz by the browser. Owns
 subnet filtering: the aggregator stays subnet-agnostic and the endpoint filters
 on read, so the subnet is a parameter of the request rather than server state.
 - `web/` — dark-themed single-page UI. Hand-rolled `<canvas>` graphs, no

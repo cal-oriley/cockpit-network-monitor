@@ -2,11 +2,12 @@
  * Polling client for GET /api/rates.
  *
  * The server owns the rolling window, so this page holds no history: every poll
- * carries a complete, bucket-aligned series per device and the page simply
- * redraws it. Rows are reconciled by IP rather than rebuilt, so only the rows
- * that actually appear or leave touch the DOM and the rest never flicker or
- * reorder under the cursor. Heading them is the combined trace, summed here
- * across whichever devices the payload listed.
+ * carries a complete, bucket-aligned series per device. The graph clock slides
+ * those samples across the canvas between buckets so the traces scroll with
+ * time instead of jumping once per sample. Rows are reconciled by IP rather
+ * than rebuilt, so only the rows that actually appear or leave touch the DOM
+ * and the rest never flicker or reorder under the cursor. Heading them is the
+ * combined trace, summed here across whichever devices the payload listed.
  *
  * Two things travel the other way, from the header up to the server: the
  * watched subnet as `?subnet=`, and the record button as `POST /api/record`.
@@ -26,6 +27,7 @@ import {
 } from './constants.js';
 import { fetchRates } from './api.js';
 import { readWindowMs, renderAxis } from './axis.js';
+import { adoptTimeline } from './graph.js';
 import {
   acceptSubnet,
   clearSubnetError,
@@ -54,8 +56,12 @@ function applyPayload(payload) {
      this subnet - and empties the grid accordingly. A `devices` that is
      missing or not a list is instead a payload this page cannot read, so the
      last good rows stay up, exactly as they do when a subnet is rejected. */
-  if (!Array.isArray(payload.devices)) return;
-  updateHeader(payload, reconcileRows(payload.devices));
+  if (Array.isArray(payload.devices)) {
+    updateHeader(payload, reconcileRows(payload.devices));
+  }
+  /* After the series, so the first paint of a new bucket already has both
+     the samples and the time they belong to. */
+  adoptTimeline(payload.now_ms, payload.bucket_ms);
 }
 
 async function pollOnce() {

@@ -77,7 +77,7 @@ reproducing the condition.
 
 The page shows a rolling 10-second window and forgets everything older. To keep
 a longer record, press **record** in the header: every datapoint is appended to
-a timestamped CSV under `recordings/`, one row per device per 250 ms bucket.
+a timestamped CSV under `recordings/`, one row per device per 100 ms bucket.
 
 ```csv
 timestamp_iso,epoch_ms,ip,pps
